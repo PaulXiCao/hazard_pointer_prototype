@@ -1,0 +1,12 @@
+---
+Checks: >-
+  bugprone-*,
+  misc-*,
+  modernize-loop-convert,
+  modernize-use-nullptr,
+  modernize-use-override,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -misc-non-private-member-variables-in-classes
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'hazard_ptr\.hpp'

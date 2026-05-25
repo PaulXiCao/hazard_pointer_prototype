@@ -1,0 +1,112 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {"major": 3, "minor": 21, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CPM_SOURCE_CACHE": "${sourceDir}/.cache/CPM"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer (Linux/macOS only)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-tsan",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$penv{OS}",
+        "rhs": "Windows_NT"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SANITIZE_THREAD": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "AddressSanitizer + UBSan (Linux/macOS only)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-asan",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$penv{OS}",
+        "rhs": "Windows_NT"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SANITIZE_ADDRESS": "ON"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI (warnings-as-errors)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-ci",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "WARNINGS_AS_ERRORS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "dev",     "configurePreset": "dev"},
+    {"name": "release", "configurePreset": "release"},
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "condition": {"type": "notEquals", "lhs": "$penv{OS}", "rhs": "Windows_NT"}
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "condition": {"type": "notEquals", "lhs": "$penv{OS}", "rhs": "Windows_NT"}
+    },
+    {"name": "ci",      "configurePreset": "ci"}
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "condition": {"type": "notEquals", "lhs": "$penv{OS}", "rhs": "Windows_NT"},
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "condition": {"type": "notEquals", "lhs": "$penv{OS}", "rhs": "Windows_NT"},
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}
