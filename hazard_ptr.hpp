@@ -446,12 +446,11 @@ inline std::atomic<void*>* HazardDomain::acquire_slot() {
 inline void HazardDomain::release_slot(std::atomic<void*>* slot) {
   slot->store(nullptr, std::memory_order::release); // clear hazard before returning slot to free pool
   const std::lock_guard _(slot_free_mutex_);
-  for (std::size_t i = 0; i < slots_.size(); ++i) {
-    if (&slots_[i].value == slot) {
-      slot_free_[i] = true;
-      --active_count_;
-      return;
-    }
+  const auto it = std::find_if(slots_.begin(), slots_.end(), [slot](const PaddedSlot& s) { return &s.value == slot; });
+  if (it != slots_.end()) {
+    slot_free_[std::distance(slots_.begin(), it)] = true;
+    --active_count_;
+    return;
   }
 #ifdef __cpp_contracts
   contract_assert(false);
