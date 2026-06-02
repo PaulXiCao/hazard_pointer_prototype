@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -229,14 +230,13 @@ private:
   // (1 cache line per 64 slots) so acquire_slot() scans it cheaply. Merging the free flag
   // into PaddedSlot would force 1 cache-line miss per slot during acquisition.
   //
-  // slots_[] uses unique_ptr so that PaddedSlot objects (and the &PaddedSlot::value pointers
-  // held by live hazard_pointer objects) are never invalidated when the vector grows.
-  // The vector's internal pointer array may be reallocated; the PaddedSlots themselves
-  // live at stable heap addresses for their entire lifetime.
+  // slots_[] uses deque so that PaddedSlot objects (and the &PaddedSlot::value pointers
+  // held by live hazard_pointer objects) are never invalidated when the deque grows:
+  // push_back/emplace_back on a deque does not move or relocate existing elements.
   std::vector<bool> slot_free_; // guarded by slot_free_mutex_; true = available
   std::mutex slot_free_mutex_;
-  std::vector<std::unique_ptr<PaddedSlot>> slots_; // structure guarded by slot_free_mutex_; PaddedSlot addresses stable
-  std::atomic_size_t active_count_ = 0;            // atomically maintained; mirrors slot_free_ occupancy
+  std::deque<PaddedSlot> slots_;        // structure guarded by slot_free_mutex_; PaddedSlot addresses stable
+  std::atomic_size_t active_count_ = 0; // atomically maintained; mirrors slot_free_ occupancy
 
   // Retired records from threads that exited with still-protected survivors.
   // Collected by synchronize() alongside live-thread lists.
@@ -416,11 +416,7 @@ inline void hazard_pointer::swap(hazard_pointer& other) noexcept { std::swap(slo
 
 // --- HazardDomain implementation --------------------------------------------
 namespace detail {
-inline HazardDomain::HazardDomain() : slot_free_(kInitialSlots, true) {
-  slots_.reserve(kInitialSlots);
-  for (std::size_t i = 0; i < kInitialSlots; ++i)
-    slots_.push_back(std::make_unique<PaddedSlot>());
-}
+inline HazardDomain::HazardDomain() : slot_free_(kInitialSlots, true), slots_(kInitialSlots) {}
 
 inline HazardDomain::~HazardDomain() {
   // Called during static-storage destruction (program exit). Thread-local storage is destroyed
@@ -437,21 +433,21 @@ inline std::atomic<void*>* HazardDomain::acquire_slot() {
     if (slot_free_[i]) {
       slot_free_[i] = false;
       ++active_count_;
-      return &slots_[i]->value;
+      return &slots_[i].value;
     }
   }
   // All slots occupied -- grow the pool by one.
   slot_free_.push_back(false);
-  slots_.push_back(std::make_unique<PaddedSlot>()); // throws std::bad_alloc on OOM
+  slots_.emplace_back(); // throws std::bad_alloc on OOM
   ++active_count_;
-  return &slots_.back()->value;
+  return &slots_.back().value;
 }
 
 inline void HazardDomain::release_slot(std::atomic<void*>* slot) {
   slot->store(nullptr, std::memory_order::release); // clear hazard before returning slot to free pool
   const std::lock_guard _(slot_free_mutex_);
   for (std::size_t i = 0; i < slots_.size(); ++i) {
-    if (&slots_[i]->value == slot) {
+    if (&slots_[i].value == slot) {
       slot_free_[i] = true;
       --active_count_;
       return;
@@ -555,13 +551,13 @@ inline void HazardDomain::synchronize() {
   // Step 2: snapshot slot addresses under slot_free_mutex_ for a consistent view of slots_.
   // Actual acquire loads happen after releasing the lock.
   const std::size_t active_hint = active_count_.load(std::memory_order::relaxed);
-  std::vector<std::atomic<void*>*> slot_ptrs;
+  std::vector<const std::atomic<void*>*> slot_ptrs;
   slot_ptrs.reserve(active_hint);
   {
     const std::lock_guard _(slot_free_mutex_);
     slot_ptrs.reserve(slots_.size());
-    for (const std::unique_ptr<PaddedSlot>& s : slots_)
-      slot_ptrs.push_back(&s->value);
+    for (const PaddedSlot& s : slots_)
+      slot_ptrs.push_back(&s.value);
   }
   std::vector<void*> snapshot_slots;
   snapshot_slots.reserve(slot_ptrs.size());
