@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstddef>
 #include <deque>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -429,12 +430,11 @@ inline HazardDomain::~HazardDomain() {
 
 inline std::atomic<void*>* HazardDomain::acquire_slot() {
   const std::lock_guard _(slot_free_mutex_);
-  for (std::size_t i = 0; i < slots_.size(); ++i) {
-    if (slot_free_[i]) {
-      slot_free_[i] = false;
-      ++active_count_;
-      return &slots_[i].value;
-    }
+  const auto it = std::find(slot_free_.begin(), slot_free_.end(), true);
+  if (it != slot_free_.end()) {
+    *it = false;
+    ++active_count_;
+    return &slots_[std::distance(slot_free_.begin(), it)].value;
   }
   // All slots occupied -- grow the pool by one.
   slot_free_.push_back(false);
