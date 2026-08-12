@@ -32,6 +32,30 @@ $preset = "dev"; cmake --preset $preset && cmake --build --preset $preset && cte
 ctest --preset dev -R "^cf_" -V
 ```
 
+**Nix / NixOS**
+
+```bash
+nix develop        # clang 21 (CI parity), gcc 14, cmake, ninja, herd7, setarch
+```
+
+`flake.nix` pins nixpkgs to the stable channel so the compiler does not move
+under a prototype whose purpose is reproducing memory-ordering behaviour.
+`nix develop` also provides `herd7`, so `tools/litmus/run.sh` works without an
+opam switch.
+
+**Sanitizers and ASLR.** On kernels that randomize more address bits than
+TSan/ASan support, every sanitized binary dies at startup with
+`FATAL: ThreadSanitizer: unexpected memory mapping` -- all tests "fail" while
+reporting no races at all. Run them with randomization disabled:
+
+```bash
+cmake --preset tsan && cmake --build --preset tsan
+setarch "$(uname -m)" -R ctest --preset tsan
+```
+
+`setarch` needs no root. The system-wide alternative is
+`sysctl vm.mmap_rnd_bits=28` (on NixOS: `boot.kernel.sysctl."vm.mmap_rnd_bits" = 28`).
+
 ## Files
 
 ```
