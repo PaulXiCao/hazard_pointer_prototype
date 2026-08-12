@@ -100,7 +100,9 @@ if changed: clear slot, update ptr, return false
 else: return true
 ```
 
-The `seq_cst` store drains the store buffer before the reload. This ensures either the synchronize snapshot sees the hazard, or the reload sees the new pointer -- preventing use-after-free on weak-memory architectures and x86 (where a `release` store can sit in the store buffer while the snapshot's `acquire`-load reads null).
+The `seq_cst` store drains the store buffer before the reload, so either the synchronize snapshot sees the hazard or the reload sees the new pointer. A `release` store would not do: it can sit in the store buffer while the snapshot's load reads null.
+
+This handles the **reader** side only. It is not on its own sufficient to prevent use-after-free -- the reclaim side additionally needs a `seq_cst` fence before its scan, because an acquire (or even seq_cst) scan load does not join the total order this pair relies on. See the fence row in [Memory Ordering](#memory-ordering) and `tools/litmus/`.
 
 ### `protect()` -- retry loop
 
@@ -113,9 +115,10 @@ loop: load src (relaxed) -> try_protect -> until success
 ```
 1. collect: foreach thread -- swap retire list out under list_mutex
            + drain orphan_list_ (records from exited threads)
-2. snapshot all active slots -> protected set (acquire loads)
-3. reclaim: delete records not in protected set (no lock held -- deleters may call retire())
-4. survivors -> calling thread's own list
+2. atomic_thread_fence(seq_cst)          <-- mandatory, see Memory Ordering
+3. snapshot all active slots -> protected set (acquire loads)
+4. reclaim: delete records not in protected set (no lock held -- deleters may call retire())
+5. survivors -> calling thread's own list
 ```
 
 Collect-then-snapshot, not snapshot-then-collect: every writer's retirement push happens under `list_mutex`, so the collect step's mutex acquires HB-after each writer's seq_cst exchange. When the snapshot's acquire-loads then run, the calling thread's vector clock already carries every writer's exchange clock. Reversing the order leaves the snapshot ahead of those mutex syncs, and TSan reports false-positive races in multi-writer/multi-reader workloads: the cross-atomic SC argument (seq_cst slot store <-> seq_cst src reload <-> seq_cst exchange) is beyond what TSan's vector-clock model tracks.
@@ -145,8 +148,15 @@ On thread exit, `~RetireListNode()`:
 | `slot_->store(p)` in `reset_protection(T*)` | `seq_cst` | P2530R3; drains store buffer so snapshot cannot miss the hazard |
 | `src.load()` re-check in `try_protect()` | `seq_cst` | P2530R3; SC pair with hazard store -- either snapshot sees hazard OR re-check sees new pointer |
 | `slot_->store(nullptr)` in `reset_protection()` | `release` | clearing hazard; no reclamation depends on observing the clear promptly |
-| scan `s.load()` in `synchronize()` | `acquire` | pairs with seq_cst store in `reset_protection(T*)` |
+| `atomic_thread_fence` before the scan in `synchronize()` | `seq_cst` | **mandatory.** An acquire scan does not join the seq_cst total order, and the collect step's lock chain orders only a *writer's* retirement -- not an independent reader's hazard store. Without it: use-after-free on weak-memory targets. Upgrading the scan loads to seq_cst instead is **not** sufficient, because the removal store on `src` is user code and need not be seq_cst. See [tools/litmus](tools/litmus/) |
+| scan `s.load()` in `synchronize()` | `acquire` | sufficient *given the fence above* |
 | `active_count_` read in `retire_impl()` | `relaxed` | heuristic threshold; stale value acceptable |
+
+The fence was added after review by Thomas Rodgers (confirmed with Maged
+Michael), who observed the reordering on POWER9/POWER10 hardware. Same shape as
+Folly's `do_reclamation()`. `tools/litmus/` locks the argument into CI:
+`hazptr-acquire-scan` → `Sometimes`, `hazptr-seqcst-loads` → `Sometimes`,
+`hazptr-fence` → `Never`.
 
 ## Reference
 

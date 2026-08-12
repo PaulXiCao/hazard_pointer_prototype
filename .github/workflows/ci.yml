@@ -151,3 +151,62 @@ jobs:
         run: cmake --preset ci -DENABLE_CLANG_TIDY=ON -DCLANG_TIDY_EXE=clang-tidy-21
       - name: Build (runs clang-tidy)
         run: cmake --build --preset ci
+
+  # GATING.  Deterministic check of the reclaim-side memory-ordering argument
+  # against the C11 abstract machine.  Platform independent -- an x86 runner is
+  # fine, since herd7 enumerates the model rather than executing on hardware.
+  # If the seq_cst fence in synchronize() is removed or weakened,
+  # hazptr-fence.litmus flips away from Never and this job fails.
+  herd7:
+    name: herd7 (memory model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-herdtools7-7.58
+      - name: Install herdtools7
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q opam
+          opam init --bare --no-setup --disable-sandboxing
+          opam switch create herd ocaml-system || opam switch herd
+          eval $(opam env)
+          opam install -y herdtools7.7.58
+      - name: Litmus suite
+        run: |
+          eval $(opam env)
+          bash tools/litmus/run.sh
+
+  # NON-GATING.  Hardware stress of the same litmus files.  Informational only:
+  # x86 runners are TSO and hide the bug entirely; ARM64 is weak but in practice
+  # often stronger than the model; POWER -- where the reviewer actually observed
+  # the reordering -- is not available on GitHub.  A clean run here is therefore
+  # inconclusive, not exculpatory, which is why it must never gate.
+  litmus7-arm64:
+    name: litmus7 (ARM64, best-effort)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-herdtools7-7.58-arm64
+      - name: Install herdtools7
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q opam
+          opam init --bare --no-setup --disable-sandboxing
+          opam switch create herd ocaml-system || opam switch herd
+          eval $(opam env)
+          opam install -y herdtools7.7.58
+      - name: Compile and run on hardware
+        run: |
+          eval $(opam env)
+          litmus7 -o /tmp/lit tools/litmus/*.litmus
+          make -C /tmp/lit -j"$(nproc)"
+          cd /tmp/lit && sh run.sh | tee /tmp/lit/results.txt
+      - name: Summary
+        run: grep -E '^(Test|Observation|Histogram)' /tmp/lit/results.txt || true

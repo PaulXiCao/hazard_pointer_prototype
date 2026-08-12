@@ -1,0 +1,41 @@
+C hazptr-fence
+
+(*
+ * The fix: a seq_cst fence on the reclaim side, between the removal store and
+ * the hazard-slot scan.  The scan loads stay acquire.
+ *
+ * Identical to hazptr-acquire-scan.litmus except for the added fence in P1.
+ *
+ * This is Maged Michael's asymmetric-fence shape, and what Folly does:
+ * do_reclamation() issues a seq_cst asymmetric_thread_fence_heavy immediately
+ * before load_hazptr_vals(), and the slot loads themselves are only relaxed
+ * (acquire only under TSan).  Only the reclaimer pays -- readers are unchanged,
+ * which is the point: the reader path is the hot one.
+ *
+ * Source mapping (hazard_ptr.hpp @ f36ed61):
+ *   the fence goes in synchronize() between the end of the collect step and the
+ *   scan loop -- i.e. after :560 (the slot-pointer snapshot closes) and before
+ *   the load loop at :563.  Note the fence must follow the *removal* store,
+ *   which happens in user code before retire(); it does, because retire() is
+ *   what eventually leads here.
+ *
+ * Expected: Never (the bug is forbidden).
+ *
+ * This file is the regression lock: if the fence is ever removed or weakened,
+ * this verdict flips and run.sh fails.
+ *)
+
+{ src = 1; haz = 0; }
+
+P0 (atomic_int *haz, atomic_int *src) {
+  atomic_store_explicit(haz, 1, memory_order_seq_cst);
+  int rsrc = atomic_load_explicit(src, memory_order_seq_cst);
+}
+
+P1 (atomic_int *haz, atomic_int *src) {
+  atomic_store_explicit(src, 0, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  int rhaz = atomic_load_explicit(haz, memory_order_acquire);
+}
+
+exists (0:rsrc=1 /\ 1:rhaz=0)

@@ -558,6 +558,31 @@ inline void HazardDomain::synchronize() {
     for (const PaddedSlot& s : slots_)
       slot_ptrs.push_back(&s.value);
   }
+  // Reclaim-side fence -- MANDATORY, not an optimization barrier.
+  //
+  // The acquire loads below do not join the seq_cst total order that the reader
+  // side relies on, and the collect step's lock chain only orders a *writer's*
+  // retirement against the collect: it adds no edge between an independent
+  // reader's hazard store and this scan.  Without this fence a reader can
+  // re-validate src, still see O (so it keeps dereferencing O), while this scan
+  // reads a stale empty slot and frees O.  [saferecl.hp.general] p6 requires the
+  // end of the protection epoch to strongly happen before the reclamation, which
+  // an acquire-only scan does not provide.
+  //
+  // Upgrading the loads below to seq_cst instead of fencing does NOT fix it: the
+  // removal store on src is user code, and P2530R3 does not require it to be
+  // seq_cst, so the StoreLoad reordering survives.  tools/litmus/ locks all
+  // three verdicts (Sometimes / Sometimes / Never) into CI.
+  //
+  // Same shape as Folly's do_reclamation(), which issues a seq_cst
+  // asymmetric_thread_fence_heavy immediately before load_hazptr_vals().  Only
+  // the reclaimer pays; the reader path is untouched.
+  //
+  // Found in review by Thomas Rodgers, confirmed with Maged Michael, and
+  // observed on POWER9/POWER10 hardware (1.4M of 959M runs):
+  // https://gcc.gnu.org/pipermail/libstdc++/2026-July/067282.html
+  std::atomic_thread_fence(std::memory_order::seq_cst);
+
   std::vector<void*> snapshot_slots;
   snapshot_slots.reserve(slot_ptrs.size());
   for (const std::atomic<void*>* sp : slot_ptrs) {

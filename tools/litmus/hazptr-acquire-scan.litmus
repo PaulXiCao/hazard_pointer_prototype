@@ -1,0 +1,53 @@
+C hazptr-acquire-scan
+
+(*
+ * The reclaim-side ordering bug as currently written.
+ * Reported by Thomas Rodgers, confirmed with Maged Michael:
+ * https://gcc.gnu.org/pipermail/libstdc++/2026-July/067282.html
+ *
+ * Source mapping (hazard_ptr.hpp @ f36ed61):
+ *   P0 haz store   <- :407  reset_protection(const T*)  slot_->store(ptr, seq_cst)
+ *   P0 src load    <- :385  try_protect                 ptr = src.load(seq_cst)
+ *   P1 src store   <- user code, NOT the header: the removal store that takes O
+ *                     out of the data structure before retire().  P2530R3 does
+ *                     not require it to be seq_cst, so release is the weakest
+ *                     a conforming user may pick -- and thus what we must model.
+ *   P1 haz load    <- :564  synchronize() step 2        sp->load(acquire)
+ *
+ * State: src holds object O (modelled as 1); haz is the hazard slot, 0 = empty.
+ *
+ * The condition is the use-after-free:
+ *   0:rsrc=1  the reader still sees O in src, so try_protect returns true and
+ *             the reader goes on dereferencing O
+ *   1:rhaz=0  the reclaimer sees an empty slot, concludes O is unprotected,
+ *             and frees it
+ *
+ * Deliberate abstraction -- P1 takes no locks.  synchronize() really holds
+ * retire_lists_mutex_ and each list_mutex during the collect step (:530-:545).
+ * They are omitted because that lock chain only orders the *writer's*
+ * retirement against the collect; an independent reader on a third thread never
+ * touches those mutexes, so they add no edge between P0's hazard store and P1's
+ * scan.  That argument is human reasoning and herd7 does not check it -- it is
+ * the load-bearing assumption of this whole file.  See README.md.
+ *
+ * Expected: Sometimes (the bug is reachable).
+ *
+ * Note: herd7 only accepts (* *) comments before the first process.  Inside a
+ * process body use //, and put nothing between the last body and `exists`.
+ *)
+
+{ src = 1; haz = 0; }
+
+P0 (atomic_int *haz, atomic_int *src) {
+  // reader: publish the hazard for O, then re-validate src
+  atomic_store_explicit(haz, 1, memory_order_seq_cst);
+  int rsrc = atomic_load_explicit(src, memory_order_seq_cst);
+}
+
+P1 (atomic_int *haz, atomic_int *src) {
+  // reclaimer: unlink O, then scan the hazard slots
+  atomic_store_explicit(src, 0, memory_order_release);
+  int rhaz = atomic_load_explicit(haz, memory_order_acquire);
+}
+
+exists (0:rsrc=1 /\ 1:rhaz=0)

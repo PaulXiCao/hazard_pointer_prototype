@@ -1,0 +1,35 @@
+C hazptr-seqcst-loads
+
+(*
+ * The tempting non-fix: upgrade the scan loads to seq_cst and add no fence.
+ *
+ * Identical to hazptr-acquire-scan.litmus except for P1's load ordering.
+ * Kept as a separate file so the suite records *why* the cheap fix was
+ * rejected rather than leaving it to a comment.
+ *
+ * The removal store on src stays release: it is user code, and P2530R3 does not
+ * require seq_cst there.  So the reclaimer's own StoreLoad pair is still free to
+ * reorder -- upgrading only the load it performs buys nothing.  This is exactly
+ * the point Rodgers makes: "Upgrading the loads alone doesn't close it, the
+ * removal store on src is user code and P2530R3 doesn't require it to be
+ * seq_cst."
+ *
+ * Source mapping: as hazptr-acquire-scan.litmus, with :564 hypothetically
+ * changed to memory_order_seq_cst.
+ *
+ * Expected: Sometimes (still reachable -- this "fix" does not work).
+ *)
+
+{ src = 1; haz = 0; }
+
+P0 (atomic_int *haz, atomic_int *src) {
+  atomic_store_explicit(haz, 1, memory_order_seq_cst);
+  int rsrc = atomic_load_explicit(src, memory_order_seq_cst);
+}
+
+P1 (atomic_int *haz, atomic_int *src) {
+  atomic_store_explicit(src, 0, memory_order_release);
+  int rhaz = atomic_load_explicit(haz, memory_order_seq_cst);
+}
+
+exists (0:rsrc=1 /\ 1:rhaz=0)
