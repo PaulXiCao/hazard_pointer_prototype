@@ -69,6 +69,40 @@ implementation. Its strongest claim is the **difference** between the files:
 `Sometimes → Never` when nothing changes but the fence isolates the fence as the
 cause, and that holds up even if the abstraction is imperfect in other ways.
 
+## Hardware runs
+
+`litmus7` compiles these same files into real binaries and samples executions on
+the host. Note the output directory must exist first, and C tests need
+`-c11 true`:
+
+```bash
+mkdir -p /tmp/lit
+nix develop --command bash -c '
+  litmus7 -c11 true -o /tmp/lit tools/litmus/*.litmus
+  make -C /tmp/lit -j"$(nproc)"
+  cd /tmp/lit && sh run.sh'
+```
+
+Measured on an x86_64 dev machine (10⁶ runs each):
+
+| File | Positive outcomes |
+|---|---|
+| `hazptr-acquire-scan` | 1 |
+| `hazptr-seqcst-loads` | 127 |
+| `hazptr-fence` | **0** |
+
+**x86 does not hide this shape**, contrary to what one might assume from
+"x86 is TSO". TSO permits precisely the StoreLoad reordering this needs, and
+P1's release store plus acquire load compile to plain `mov`s with nothing
+between them. When Rodgers says x86 hides it, that is about the *real* code,
+where the reclaim path's mutex locked-RMWs sit between the removal store and the
+scan — a different program from this abstraction, and a reminder that the
+abstraction is not the implementation in *both* directions.
+
+A sampled run can only ever supply weak positive evidence; zero positives never
+clears the fix, which is why the hardware job is non-gating and `run.sh`
+(herd7) is the gate.
+
 ## Keeping it honest
 
 - Every access in every file carries a comment naming the `hazard_ptr.hpp` line

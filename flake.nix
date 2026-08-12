@@ -45,7 +45,10 @@
             export CXX=clang++
             export CC=clang
             export ASAN_SYMBOLIZER_PATH=${pkgs.llvm_21}/bin/llvm-symbolizer
-            cat <<'EOF'
+
+            # Interactive only -- `nix develop --command ...` is used in CI and
+            # scripts, where a banner on stdout is noise that breaks parsing.
+            case $- in *i*) cat <<'EOF' ;; esac
 hazard_pointer prototype dev shell
 
   cmake --preset dev  && cmake --build --preset dev  && ctest --preset dev

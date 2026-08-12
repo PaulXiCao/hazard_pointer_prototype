@@ -4,6 +4,7 @@ on:
   push:
     branches: master
   pull_request:
+  workflow_dispatch:      # litmus7-arm64 runs on this event only
 
 env:
   CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
@@ -162,51 +163,59 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: cachix/install-nix-action@v31
+      # herdtools7 is not packaged in nixpkgs, so the flake builds it from
+      # source (~3-6 min).  Cache /nix/store keyed on flake.lock so that only
+      # happens when the pin actually changes.
+      - uses: nix-community/cache-nix-action@v6
         with:
-          path: ~/.opam
-          key: opam-herdtools7-7.58
-      - name: Install herdtools7
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q opam
-          opam init --bare --no-setup --disable-sandboxing
-          opam switch create herd ocaml-system || opam switch herd
-          eval $(opam env)
-          opam install -y herdtools7.7.58
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'tools/litmus/herdtools7.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 2G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 604800
       - name: Litmus suite
-        run: |
-          eval $(opam env)
-          bash tools/litmus/run.sh
+        run: nix develop --command bash tools/litmus/run.sh
 
-  # NON-GATING.  Hardware stress of the same litmus files.  Informational only:
-  # x86 runners are TSO and hide the bug entirely; ARM64 is weak but in practice
-  # often stronger than the model; POWER -- where the reviewer actually observed
-  # the reordering -- is not available on GitHub.  A clean run here is therefore
-  # inconclusive, not exculpatory, which is why it must never gate.
+  # MANUAL DISPATCH ONLY, and non-gating even then.  Hardware stress of the same
+  # litmus files.
+  #
+  # A clean run proves nothing -- sampling can only ever produce weak positive
+  # evidence, never a green light -- so this must not gate, and is not worth a
+  # toolchain build on every push.  Run it from the Actions tab when
+  # investigating.
+  #
+  # Note x86 does NOT hide this shape: TSO permits exactly the StoreLoad
+  # reordering it needs, and P1's release store + acquire load compile to plain
+  # movs.  Observed on an x86_64 dev machine at 1 and 127 per 10^6.  (What
+  # Rodgers meant by x86 hiding it is the *real* code, where the reclaim path's
+  # mutex locked-RMWs sit between the removal store and the scan -- a different
+  # program from this abstraction.)  So this job is useful on x86 too; ARM64 is
+  # kept because weaker hardware should show it more readily.
   litmus7-arm64:
-    name: litmus7 (ARM64, best-effort)
+    name: litmus7 (ARM64, manual)
     runs-on: ubuntu-24.04-arm
+    if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
         with:
-          path: ~/.opam
-          key: opam-herdtools7-7.58-arm64
-      - name: Install herdtools7
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q opam
-          opam init --bare --no-setup --disable-sandboxing
-          opam switch create herd ocaml-system || opam switch herd
-          eval $(opam env)
-          opam install -y herdtools7.7.58
+          primary-key: nix-arm64-${{ hashFiles('flake.lock', 'tools/litmus/herdtools7.nix') }}
+          restore-prefixes-first-match: nix-arm64-
+          gc-max-store-size-linux: 2G
+      # -c11 true is required for C litmus tests, and litmus7 will not create
+      # the output directory itself.
       - name: Compile and run on hardware
         run: |
-          eval $(opam env)
-          litmus7 -o /tmp/lit tools/litmus/*.litmus
-          make -C /tmp/lit -j"$(nproc)"
-          cd /tmp/lit && sh run.sh | tee /tmp/lit/results.txt
+          mkdir -p /tmp/lit
+          nix develop --command bash -c '
+            set -e
+            litmus7 -c11 true -o /tmp/lit tools/litmus/*.litmus
+            make -C /tmp/lit -j"$(nproc)"
+            cd /tmp/lit && sh run.sh
+          ' | tee /tmp/results.txt
       - name: Summary
-        run: grep -E '^(Test|Observation|Histogram)' /tmp/lit/results.txt || true
+        run: grep -E '^(Test|Observation|Histogram)' /tmp/results.txt || true
