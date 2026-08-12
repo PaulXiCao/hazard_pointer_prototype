@@ -21,16 +21,14 @@ if(ENABLE_CLANG_TIDY)
   find_program(CLANG_TIDY_EXE NAMES clang-tidy REQUIRED)
 endif()
 
-# Download CPM on first configure
-set(CPM_VERSION 0.40.2)
-set(CPM_CACHE "${CMAKE_CURRENT_BINARY_DIR}/CPM_${CPM_VERSION}.cmake")
-if(NOT EXISTS "${CPM_CACHE}")
-  file(DOWNLOAD
-    "https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_VERSION}/CPM.cmake"
-    "${CPM_CACHE}"
-  )
-endif()
-include("${CPM_CACHE}")
+# Bootstrap CPM using FetchContent so CPMAddPackage is always available
+include(FetchContent)
+FetchContent_Declare(
+  CPM
+  GIT_REPOSITORY https://github.com/cpm-cmake/CPM.cmake.git
+  GIT_TAG v0.40.2
+)
+FetchContent_MakeAvailable(CPM)
 
 CPMAddPackage("gh:google/googletest@1.15.2")
 # gtest 1.15.2 has an implicit char8_t→char32_t conversion that triggers
