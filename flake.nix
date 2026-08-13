@@ -22,6 +22,27 @@
       });
 
       devShells = forAllSystems (pkgs: {
+        # Just enough to configure and build -- the contracts CI job's shell.
+        # Kept separate from `default` so the everyday shell does not carry
+        # gcc16's closure on top of the clang/gcc14/herdtools7 it already has.
+        #
+        # gcc-16 used to come from ppa:ubuntu-toolchain-r/test, but
+        # add-apt-repository reads from Launchpad on every run and died there
+        # (IncompleteRead) on 2026-08-12.  Caching the .debs would not have
+        # helped: GitHub evicts caches untouched for 7 days and this repo's runs
+        # are weeks apart, so the PPA would still be hit nearly every time.
+        # nixpkgs ships gcc 16.1.0 prebuilt (92 MB from cache.nixos.org, no
+        # source build) and pins it in flake.lock, which suits a prototype about
+        # reproducing memory-ordering behaviour better than a moving PPA.
+        gcc16 = pkgs.mkShell {
+          name = "hazard-pointer-prototype-gcc16";
+          packages = with pkgs; [ gcc16 cmake ninja git ];
+          shellHook = ''
+            export CXX=g++
+            export CC=gcc
+          '';
+        };
+
         default = pkgs.mkShell {
           name = "hazard-pointer-prototype";
 
@@ -67,7 +88,8 @@ than TSan/ASan can cope with, and every sanitized binary dies immediately with
 (The alternative is system-wide: boot.kernel.sysctl."vm.mmap_rnd_bits" = 28.
 setarch needs no root, so prefer it.)
 
-First configure downloads CPM + GTest, so it needs network.
+CPM is vendored in cmake/; the first configure still fetches GTest, so it needs
+network once (cached afterwards under .cache/CPM).
 EOF
           '';
         };
