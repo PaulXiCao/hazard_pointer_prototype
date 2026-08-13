@@ -99,7 +99,13 @@ jobs:
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
           key: cpm-windows-${{ hashFiles('CMakeLists.txt') }}
-      - uses: ilammy/msvc-dev-cmd@v1
+      # Sets up the vcvars environment, which the Ninja generator needs to find
+      # MSVC (the Visual Studio generator would locate it unaided).  Replaces
+      # ilammy/msvc-dev-cmd@v1, abandoned since 2024 and stuck on node20 with no
+      # release to bump to.  Exact version: no floating major tag is published.
+      - uses: TheMrMilchmann/setup-msvc-dev@v4.1.0
+        with:
+          arch: x64
       - name: Configure
         run: cmake --preset dev
       - run: cmake --build --preset dev
