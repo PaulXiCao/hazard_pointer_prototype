@@ -175,9 +175,16 @@ jobs:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       # herdtools7 is not packaged in nixpkgs, so the flake builds it from
-      # source (~3-6 min).  Cache /nix/store keyed on flake.lock so that only
+      # source (~2 min).  Cache /nix/store keyed on flake.lock so that only
       # happens when the pin actually changes.
-      - uses: nix-community/cache-nix-action@v6
+      #
+      # v7, not v6: v6 unpacks the cache into /nix/store as the runner user,
+      # but install-nix-action does a multi-user *daemon* install where that
+      # path is root-owned, so restore died with "tar: Permission denied" (exit
+      # 2) on every run.  The job then rebuilt herdtools7 anyway, having first
+      # downloaded 560 MB to throw away -- worse than no cache.  v7 added
+      # support for install-nix-action explicitly.
+      - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'tools/litmus/herdtools7.nix') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
@@ -211,7 +218,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action@v6
+      - uses: nix-community/cache-nix-action@v7   # see the herd7 job on v6
         with:
           primary-key: nix-arm64-${{ hashFiles('flake.lock', 'tools/litmus/herdtools7.nix') }}
           restore-prefixes-first-match: nix-arm64-
