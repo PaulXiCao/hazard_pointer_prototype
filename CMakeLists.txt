@@ -21,16 +21,14 @@ if(ENABLE_CLANG_TIDY)
   find_program(CLANG_TIDY_EXE NAMES clang-tidy REQUIRED)
 endif()
 
-# Download CPM on first configure
-set(CPM_VERSION 0.40.2)
-set(CPM_CACHE "${CMAKE_CURRENT_BINARY_DIR}/CPM_${CPM_VERSION}.cmake")
-if(NOT EXISTS "${CPM_CACHE}")
-  file(DOWNLOAD
-    "https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_VERSION}/CPM.cmake"
-    "${CPM_CACHE}"
-  )
-endif()
-include("${CPM_CACHE}")
+# CPM is vendored (cmake/CPM.cmake, v0.40.2, upstream release verbatim --
+# sha256 c8cdc32c03816538ce22781ed72964dc864b2a34a310d3b7104812a5ca2d835d).
+# It used to be fetched per configure with file(DOWNLOAD), which had no STATUS
+# or EXPECTED_HASH: a throttled release-CDN response wrote an empty file,
+# include() then succeeded silently, and configure died on "Unknown CMake
+# command CPMAddPackage" -- an error naming neither the download nor the cause.
+# To update, drop in the new release file and refresh the version and hash here.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/CPM.cmake")
 
 CPMAddPackage("gh:google/googletest@1.15.2")
 # gtest 1.15.2 has an implicit char8_t→char32_t conversion that triggers

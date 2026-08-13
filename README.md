@@ -13,7 +13,7 @@ C++26 standard; it lives in `proto::detail` as a test helper only.
 
 ## Build
 
-Requires CMake 3.21+, Ninja, C++26 compiler. First configure downloads CPM and fetches GTest -- requires internet.
+Requires CMake 3.21+, Ninja, C++26 compiler. CPM is vendored in `cmake/CPM.cmake`; the first configure fetches GTest through it -- requires internet once, then cached under `.cache/CPM`.
 
 **Linux / macOS (bash)**
 ```bash
