@@ -90,7 +90,7 @@ void Quarantine::reclaim(QuarantinedNode* ptr) {
 }
 
 Quarantine::~Quarantine() {
-  for (QuarantinedNode* ptr : nodes)
+  for (const QuarantinedNode* ptr : nodes)
     delete ptr;
 }
 

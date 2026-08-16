@@ -33,6 +33,8 @@ struct Node : proto::hazard_pointer_obj_base<Node> {
 // mixing with the untouched aligned overloads is safe.
 void* operator new(std::size_t n) {
   note_allocation();
+  // Returned as void* below, so a const void* here would not compile.
+  // NOLINTNEXTLINE(misc-const-correctness)
   void* const p = std::malloc(n == 0 ? 1 : n);
   if (p == nullptr)
     throw std::bad_alloc();
