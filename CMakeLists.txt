@@ -16,6 +16,7 @@ option(SANITIZE_THREAD   "Build with ThreadSanitizer"   OFF)
 option(SANITIZE_ADDRESS  "Build with AddressSanitizer"  OFF)
 option(WARNINGS_AS_ERRORS "Treat warnings as errors"    OFF)
 option(ENABLE_CLANG_TIDY  "Run clang-tidy on project targets" OFF)
+option(ENABLE_BENCHMARKS  "Build the microbenchmarks (bench/)"          OFF)
 
 if(ENABLE_CLANG_TIDY)
   find_program(CLANG_TIDY_EXE NAMES clang-tidy REQUIRED)
@@ -42,3 +43,7 @@ endforeach()
 
 enable_testing()
 add_subdirectory(tests)
+
+if(ENABLE_BENCHMARKS)
+  add_subdirectory(bench)
+endif()

@@ -68,6 +68,16 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "WARNINGS_AS_ERRORS": "ON"
       }
+    },
+    {
+      "name": "bench",
+      "displayName": "Benchmarks (Release)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-bench",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ENABLE_BENCHMARKS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -83,7 +93,8 @@
       "configurePreset": "asan",
       "condition": {"type": "notEquals", "lhs": "$penv{OS}", "rhs": "Windows_NT"}
     },
-    {"name": "ci",      "configurePreset": "ci"}
+    {"name": "ci",      "configurePreset": "ci"},
+    {"name": "bench",   "configurePreset": "bench"}
   ],
   "testPresets": [
     {
