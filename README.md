@@ -2,8 +2,9 @@
 
 Prototype implementation of C++26 `std::hazard_pointer` for learning and algorithm validation.
 API mirrors `<hazard_pointer>` (`hazard_pointer_obj_base`, `hazard_pointer`, `make_hazard_pointer`)
-to keep the prototype directly portable to libstdc++. `hazard_pointer_clean_up()` is not in the
-C++26 standard; it lives in `proto::detail` as a test helper only.
+to keep the prototype directly portable to libstdc++. Tests reach into `proto::detail` for
+`hazptr_default_domain().synchronize()`, `active_slots()` and `retire_list_size()`; nothing else
+outside the standard API is exposed.
 
 ## Purpose
 
@@ -56,12 +57,38 @@ setarch "$(uname -m)" -R ctest --preset tsan
 `setarch` needs no root. The system-wide alternative is
 `sysctl vm.mmap_rnd_bits=28` (on NixOS: `boot.kernel.sysctl."vm.mmap_rnd_bits" = 28`).
 
+### Benchmarks
+
+Opt-in, so the default build does not pay for a second external dependency:
+
+```bash
+cmake --preset bench && cmake --build --preset bench
+./build-bench/bench/bench_current   --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
+./build-bench/bench/bench_baseline  --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
+```
+
+`bench_baseline` compiles the same source against `bench/baseline/hazard_ptr.hpp`, the header as
+of `1eb5325` -- post-R1-fence, pre-R2 -- so the delta isolates the intrusive retire list and the
+record-list handle.
+
+**Run the pool-sensitive benchmarks one per process.** Every benchmark shares one process and one
+process-global domain, and records are never unlinked, so `BM_SynchronizeScan` and
+`BM_RetirePushOnly` inherit whatever record pool the benchmarks before them left behind. With a
+filter that admits more than one of them, the parameter sweep measures almost nothing and does so
+silently.
+
 ## Files
 
 ```
 hazard_ptr.hpp              # single-header prototype
 PORTING_NOTES.md            # libstdc++ porting checklist
-CMakePresets.json           # dev / release / tsan / asan / ci presets
+CMakePresets.json           # dev / release / tsan / asan / ci / bench presets
+flake.nix                   # dev shell: clang-21, gcc-14, gcc-16, herd7
+cmake/CPM.cmake             # vendored, not fetched per configure
+tools/litmus/               # herd7 memory-model tests + run.sh (gating CI job)
+bench/                      # microbenchmarks, opt-in via ENABLE_BENCHMARKS
+  bench_hazptr.cpp          #   one source, compiled against both headers
+  baseline/hazard_ptr.hpp   #   header as of 1eb5325 (post-R1-fence, pre-R2)
 tests/
   # One file per API function
   test_hazard_pointer_ctor.cpp   # default ctor, move ctor, destructor
@@ -73,6 +100,7 @@ tests/
   test_swap.cpp                  # swap() member + free swap()
   test_move_assign.cpp           # operator=(&&)
   test_retire.cpp                # retire() + synchronize() reclamation
+  test_retire_no_alloc.cpp       # replaces operator new; proves retire() allocates nothing
   test_custom_deleter.cpp        # retire() with custom deleter D
   # Compile-time property tests
   test_noexcept.cpp              # static_assert(noexcept(...)) for all noexcept APIs
@@ -160,7 +188,7 @@ if size > 2 * active_count_: synchronize()
 
 ### Thread-local registry
 
-Each thread lazily registers its `RetireListNode` into a global singly-linked list on first `retire_impl()` or `synchronize()` call. `RetireListNode` and its retire list live in a single `thread_local ThreadState` so that member-destruction order guarantees the vector outlives the node.
+Each thread lazily registers its `RetireListNode` into a global singly-linked list on first `retire_impl()` or `synchronize()` call. The retire list lives directly in the node. (It used to be a separately-stored `std::vector` inside a `ThreadState` wrapper whose only job was to make member-destruction order keep the vector alive longer than the node; three raw pointers need no such ordering, so the wrapper is gone.)
 
 On thread exit, `~RetireListNode()`:
 1. Calls `synchronize()` to reclaim as much as possible.
@@ -176,7 +204,11 @@ On thread exit, `~RetireListNode()`:
 | `rec_->hazard.store(nullptr)` in `reset_protection()` | `release` | clearing hazard; no reclamation depends on observing the clear promptly |
 | `atomic_thread_fence` before the scan in `synchronize()` | `seq_cst` | **mandatory.** An acquire scan does not join the seq_cst total order, and the collect step's lock chain orders only a *writer's* retirement -- not an independent reader's hazard store. Without it: use-after-free on weak-memory targets. Upgrading the scan loads to seq_cst instead is **not** sufficient, because the removal store on `src` is user code and need not be seq_cst. See [tools/litmus](tools/litmus/) |
 | scan `s.load()` in `synchronize()` | `acquire` | sufficient *given the fence above* |
-| `active_count_` read in `retire_impl()` | `relaxed` | heuristic threshold; stale value acceptable |
+| `rec->active.load()` before the CAS in `acquire_rec()` | `relaxed` | test-and-test-and-set. Not an optimisation: without it every occupied record on the way to a free one costs a *failed* `compare_exchange`, which still takes the line exclusively and dirties it. Measured 4.9x on a 256-deep claim. A stale `true` skips a record; a stale `false` is resolved by the CAS |
+| `rec->active` CAS in `acquire_rec()` | `acquire` / `relaxed` | pairs with the release store below, so a claimer sees the cleared hazard |
+| `rec->active.store(false)` in `release_rec()` | `release` | offers the record for reuse only after the hazard clear is visible |
+| `recs_head_` publish / traverse | `release` / `acquire` | a scan that misses a new record cannot have missed a committed reader either -- the seq_cst fence already forces that |
+| `active_count_` add, sub, and read | `relaxed` | feeds only `retire_impl()`'s heuristic threshold and `active_slots()` (tests). Nothing is ordered through it, and as a seq_cst RMW it was a second contended line on every acquire and release |
 
 The fence was added after review by Thomas Rodgers (confirmed with Maged
 Michael), who observed the reordering on POWER9/POWER10 hardware. Same shape as
