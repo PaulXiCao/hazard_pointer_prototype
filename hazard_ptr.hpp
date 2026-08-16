@@ -687,8 +687,8 @@ inline HazardDomain::~HazardDomain() {
 
   // Records outlive every hazard_pointer by construction -- release_rec() only
   // clears a flag -- so they are freed here, once all threads are gone.
-  for (HazptrRec* rec = recs_head_.load(std::memory_order::relaxed); rec != nullptr;) {
-    HazptrRec* const next = rec->next;
+  for (const HazptrRec* rec = recs_head_.load(std::memory_order::relaxed); rec != nullptr;) {
+    const HazptrRec* const next = rec->next;
     delete rec;
     rec = next;
   }
@@ -886,6 +886,9 @@ inline void HazardDomain::synchronize() noexcept {
 
   if (have_buffer) {
     for (const HazptrRec* rec = recs; rec != nullptr; rec = rec->next) {
+      // snapshot is a vector<void*>, so a const void* here would not survive
+      // the push_back below.
+      // NOLINTNEXTLINE(misc-const-correctness)
       if (void* const ptr = rec->hazard.load(std::memory_order::acquire))
         snapshot.push_back(ptr); // within the capacity reserved above
     }
