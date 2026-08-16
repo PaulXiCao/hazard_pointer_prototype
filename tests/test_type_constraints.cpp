@@ -12,7 +12,7 @@ struct SimpleNode : proto::hazard_pointer_obj_base<SimpleNode> {};
 struct CustomDelNode : proto::hazard_pointer_obj_base<CustomDelNode, std::default_delete<CustomDelNode>> {};
 
 // Indirect derivation: FurtherDerived -> SimpleNode -> hazard_pointer_obj_base<SimpleNode>
-// Still carries hazard_obj_base_tag -> HazardProtectable<FurtherDerived> is true.
+// Still carries the HazptrObj base -> HazardProtectable<FurtherDerived> is true.
 struct FurtherDerived : SimpleNode {};
 
 // Not hazard-protectable.

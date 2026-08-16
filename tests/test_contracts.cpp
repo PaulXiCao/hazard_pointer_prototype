@@ -33,7 +33,10 @@ TEST(ContractDeathTest, ResetProtectionPtrOnEmpty) {
 
 TEST(ContractDeathTest, DoubleRetire) {
   // hp protects p so synchronize() cannot reclaim it between the two retire()
-  // calls; the second retire() reaches pre(!retired_) while p is still alive.
+  // calls; the second retire() reaches pre(not_retired()) while p is still
+  // alive. The sentinel backing that precondition is the intrusive next
+  // pointer, so unlike the bool it replaced it costs no space and also fires
+  // in builds without contracts (as an assert).
   EXPECT_DEATH(
       {
         auto hp = make_hazard_pointer();
@@ -41,7 +44,7 @@ TEST(ContractDeathTest, DoubleRetire) {
         const std::atomic<Node*> src{p};
         (void)hp.protect(src);
         p->retire();
-        p->retire(); // pre(!retired_) fires
+        p->retire(); // pre(not_retired()) fires
       },
       "");
 }

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <iterator>
 #include <memory>
@@ -17,13 +18,154 @@
 #include <utility>
 #include <vector>
 
+// MSVC accepts the standard [[no_unique_address]] but ignores it for ABI
+// compatibility; its own spelling is the one that works. Without this, the
+// empty default_delete member costs 8 bytes of padding in every protectable
+// object and eats the space reserved below. libstdc++ has
+// _GLIBCXX_NO_UNIQUE_ADDRESS for this -- see PORTING_NOTES.md.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PROTO_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+#else
+#define PROTO_NO_UNIQUE_ADDRESS [[no_unique_address]]
+#endif
+
 namespace proto {
 
+class hazard_pointer;
+
 namespace detail {
-// Empty tag privately inherited by hazard_pointer_obj_base<T,D>. Enables the
-// HazardProtectable concept to detect T derives from some hazard_pointer_obj_base<T,D>
-// without knowing D. std::is_base_of ignores access -- private inheritance suffices.
-struct hazard_obj_base_tag {};
+
+struct HazptrObj;
+
+// Type-erased reclamation: invokes the object's deleter on the object.
+using reclaim_fn = void (*)(HazptrObj*);
+
+// Non-template private base of hazard_pointer_obj_base<T,D>.
+//
+// Carries the intrusive retire link and the erased reclaim function, so
+// retire() is a pointer splice into a per-thread list and cannot allocate.
+// [saferecl.hp.base] declares retire() noexcept, so an allocating retire turns
+// OOM into terminate(); putting the list storage in the object is the only way
+// out, because a per-thread side table has to be grown by retire() itself.
+//
+// It also carries the space P2530R3 1.5 ("Guidance for ABI-Stability")
+// reserves for the two extensions the paper expects. That reservation is a
+// one-way door: hazard_pointer_obj_base is a standard-specified type that
+// users *derive from*, so its size is baked into user binaries, and
+// libstdc++'s own doc/xml/manual/abi.xml lists changing the layout of a
+// standard-specified type as a prohibited change. The reserved members must
+// also be *initialised* here, for the same reason: the constructor is inlined
+// into user code, so code compiled before a future extension would otherwise
+// leave them uninitialised. The corresponding *check* in retire() can be added
+// later, since nothing today can set a non-null cohort.
+//
+// Doubles as the tag the HazardProtectable concept detects: std::is_base_of
+// ignores access, so one private base does both jobs.
+struct HazptrObj {
+  // next == this means "not retired"; every constructor re-establishes it.
+  // Backs the [saferecl.hp.base]/6 precondition "x is not retired" in every
+  // build rather than only under contracts, and costs nothing -- the link has
+  // to be there anyway. Folly's hazptr_obj uses the same sentinel.
+  HazptrObj* next = this;
+  reclaim_fn reclaim = nullptr;
+
+  // RESERVED for P2530R3 1.5. Never read or written by this implementation.
+  void* cohort = nullptr;  // 1.5 item 2: cohort-based synchronous reclamation
+  std::uint64_t count = 0; // 1.5 item 1: integrated commutative counting
+
+  // Phrased negatively because both call sites assert the negative:
+  // `pre(not_retired())` rather than `pre(!retired())`, where a lone `!` inside
+  // a contract annotation is easy to read past.
+  [[nodiscard]] bool not_retired() const noexcept { return next == this; }
+
+  HazptrObj() noexcept = default;
+
+  // A copy is a new, unretired object, so the retirement state must not be
+  // copied -- otherwise retiring the copy would look like a double retire.
+  // This is what costs hazard_pointer_obj_base its trivial copyability, and
+  // there is no layout that is both trivially copyable and correct: a trivial
+  // copy necessarily copies the state. Folly makes the same trade.
+  HazptrObj(const HazptrObj&) noexcept {}
+  HazptrObj(HazptrObj&&) noexcept {}
+  // Assignment leaves the retirement state alone: assigning to an object does
+  // not retire or un-retire it. Deliberately a no-op, so self-assignment needs
+  // no special case -- hence the suppressions.
+  HazptrObj& operator=(const HazptrObj&) noexcept { // NOLINT(bugprone-unhandled-self-assignment)
+    return *this;
+  }
+  HazptrObj& operator=(HazptrObj&&) noexcept { // NOLINT(bugprone-unhandled-self-assignment)
+    return *this;
+  }
+  ~HazptrObj() = default;
+};
+
+// Intrusive singly-linked list of HazptrObj, with O(1) splice.
+//
+// head/tail rather than head alone: synchronize() concatenates every thread's
+// list into one chain, and without a tail pointer each concatenation would walk
+// the list it is appending to.
+//
+// Replacing the per-thread std::vector with this is not the performance
+// regression it looks like:
+//   - retire() gets cheaper and, more importantly, predictable: two stores and
+//     an increment, with no reallocation and no amortisation spike.
+//   - synchronize()'s collect step goes from copying every record into one
+//     growing vector to O(1) pointer splices.
+//   - the scan is roughly neutral. It walks obj->next instead of a contiguous
+//     record array, but reclaiming an object already touches its first cache
+//     line (the destructor and operator delete both do), so those misses were
+//     going to be paid anyway; the vector was an extra array on top of them.
+// The real cost is memory, and it is worth being explicit about: the old
+// version spent 16 bytes per *retired* object, this one spends 32 bytes per
+// *protectable* object whether or not it is ever retired. That is the trade
+// P2530R3 1.5 and Folly both take, and it is not optional here -- an allocating
+// retire() cannot honour the noexcept in [saferecl.hp.base].
+// Numbers rather than reasoning: PLAN step 4's microbenchmark.
+struct RetireList {
+  HazptrObj* head = nullptr;
+  HazptrObj* tail = nullptr;
+  std::size_t size = 0; // O(1); retire_impl()'s threshold needs it
+
+  // Tests head rather than size: head is the structural invariant the traversal
+  // in synchronize() actually relies on, whereas size is a cache maintained
+  // alongside it purely for retire_impl()'s threshold. If the two ever
+  // disagree, believing head fails safe.
+  [[nodiscard]] bool empty() const noexcept { return head == nullptr; }
+
+  void push(HazptrObj* obj) noexcept {
+    obj->next = head;
+    if (empty())
+      tail = obj;
+    head = obj;
+    ++size;
+  }
+
+  // Move every node of other to the front of *this; other becomes empty.
+  // Named for the ownership transfer (as std::list::splice is), not for the
+  // position: "prepend" would not convey that other is left empty. Order is
+  // irrelevant here -- the scan visits every node regardless.
+  void splice(RetireList& other) noexcept {
+    if (other.empty())
+      return;
+    if (empty()) {
+      head = other.head;
+      tail = other.tail;
+    } else {
+      other.tail->next = head;
+      head = other.head;
+    }
+    size += other.size;
+    other.clear();
+  }
+
+  void clear() noexcept {
+    head = tail = nullptr;
+    size = 0;
+  }
+
+  // Detach the whole list, leaving *this empty.
+  [[nodiscard]] RetireList take() noexcept { return std::exchange(*this, RetireList{}); }
+};
 } // namespace detail
 
 // --- hazard_pointer_obj_base ------------------------------------------------
@@ -32,14 +174,14 @@ struct hazard_obj_base_tag {};
 // T must derive from hazard_pointer_obj_base<T[, D]>.
 // D is the deleter type; defaults to std::default_delete<T> (i.e. operator delete).
 template <class T, class D = std::default_delete<T>>
-class hazard_pointer_obj_base : private detail::hazard_obj_base_tag {
+class hazard_pointer_obj_base : private detail::HazptrObj {
 public:
-  // Submit this to the default domain's retire list.
+  // Splice this onto the calling thread's retire list in the default domain.
   // Deletion is deferred until synchronize() confirms no hazard pointer holds this address.
   // pre contracts ([32.11.3.3]/6): x is not already retired; move-assigning d does not throw.
   void retire(D d = D()) noexcept
 #ifdef __cpp_contracts
-      pre(!retired_) pre(std::is_nothrow_move_assignable_v<D>)
+      pre(not_retired()) pre(std::is_nothrow_move_assignable_v<D>)
 #endif
           ;
 
@@ -52,11 +194,40 @@ protected:
   ~hazard_pointer_obj_base() = default;
 
 private:
-  D deleter;
-#ifdef __cpp_contracts
-  bool retired_ = false; // only needed to back the pre contract (x is not retired)
-#endif
+  // [[no_unique_address]] is what pays for the space HazptrObj reserves: with a
+  // stateless deleter (the default_delete case) it keeps the empty member out
+  // of the object's size instead of costing a full aligned word.
+  PROTO_NO_UNIQUE_ADDRESS D deleter;
+
+  // reset_protection() has to map a T* to the HazptrObj subobject that
+  // synchronize()'s scan compares against, and that base is private. Folly
+  // makes its equivalent base public instead; private plus a friend keeps the
+  // implicit T* -> HazptrObj* conversion out of user overload resolution.
+  friend class hazard_pointer;
 };
+
+namespace detail {
+// Layout tripwire. hazard_pointer_obj_base is a standard-specified type that
+// users derive from, so its size is baked into user binaries and cannot be
+// changed once shipped -- libstdc++'s doc/xml/manual/abi.xml lists that as a
+// prohibited change. The reserved members exist precisely so the size does not
+// have to move later; pin it here so an accidental change fails the build
+// rather than the field. Guarded on 8-byte pointers so 32-bit targets are not
+// held to a 64-bit number.
+struct AbiProbe : hazard_pointer_obj_base<AbiProbe> {};
+static_assert(sizeof(void*) != 8 || sizeof(hazard_pointer_obj_base<AbiProbe>) == 32,
+              "hazard_pointer_obj_base layout changed -- this is an ABI break, not a refactor");
+static_assert(sizeof(void*) != 8 || alignof(hazard_pointer_obj_base<AbiProbe>) == 8,
+              "hazard_pointer_obj_base alignment changed -- this is an ABI break");
+
+// The pinned number is per-ABI, so it is guarded on LP64 rather than
+// generalised: any formula portable enough to hold on every ABI would have to
+// be derived from the members, which would make the assertion follow the code
+// instead of pinning it. LP64 is what libstdc++ ships on for every target this
+// prototype is exercised on, including the ubuntu-24.04-arm CI runner. A
+// 32-bit pin would need a cross-compiled (-m32) job; GitHub offers no 32-bit
+// runner.
+} // namespace detail
 
 // --- hazard_pointer ---------------------------------------------------------
 
@@ -158,21 +329,24 @@ namespace detail {
 
 // Approximation of "hazard-protectable type" ([32.11.3.1]/2).
 // Checks: T is a class that derives from some hazard_pointer_obj_base<T,D> (for any D),
-//         detected via the private hazard_obj_base_tag base (std::is_base_of ignores access).
+//         detected via the private HazptrObj base (std::is_base_of ignores access).
 // Not checked here (D unknown -- verified in retire() where D is explicit):
 //   - hazard_pointer_obj_base<T,D> is a PUBLIC base of T
 //   - hazard_pointer_obj_base<T,D> is a NON-VIRTUAL base of T
 //   - exactly one such base exists (no other hazard_pointer_obj_base<T2,D2>)
 template <class T>
-concept HazardProtectable = std::is_class_v<T> && std::is_base_of_v<hazard_obj_base_tag, T>;
+concept HazardProtectable = std::is_class_v<T> && std::is_base_of_v<HazptrObj, T>;
 
-using deleter_fn = void (*)(void*);
-
-// Type-erased retirement entry: pointer + deleter queued for reclamation.
-struct RetireRecord {
-  void* ptr = nullptr;
-  deleter_fn deleter = nullptr;
-};
+// On the noexcept guarantees below: since C++17 noexcept is part of the
+// function *type*, not an attribute, so a declaration and its definition must
+// agree or the program is ill-formed. What it does NOT mean is that the body
+// cannot throw -- only that std::terminate() is called if it does, and the
+// compiler never verifies the body. tests/test_noexcept.cpp checks the declared
+// specification (`static_assert(noexcept(expr))`), which is the specification,
+// not the behaviour. The behavioural half is clang-tidy's
+// bugprone-exception-escape, enabled here via `bugprone-*`; it catches a
+// reachable `throw`, but not a call to a merely non-noexcept function such as
+// std::mutex::lock, which is exactly the residual hole documented on retire().
 
 struct RetireListNode;
 
@@ -210,13 +384,16 @@ public:
   // Return a slot to the pool.
   void release_slot(std::atomic<void*>* slot);
 
-  // Append {ptr, deleter} to the retire list.
+  // Splice obj onto the calling thread's retire list.
   // Auto-synchronizes when list size exceeds 2 * active_count_.
-  void retire_impl(void* ptr, deleter_fn deleter);
+  // noexcept: reached from retire(), which [saferecl.hp.base] declares noexcept.
+  void retire_impl(HazptrObj* obj) noexcept;
 
   // Snapshot all active slots -> protected set.
   // Reclaim every retired object whose pointer is not in the protected set.
-  void synchronize();
+  // noexcept: same reason, plus [saferecl.hp.general]/5 makes a throwing
+  // deleter undefined behaviour.
+  void synchronize() noexcept;
 
   // Number of currently acquired slots. Exposed for testing.
   [[nodiscard]] std::size_t active_slots() const noexcept;
@@ -239,9 +416,9 @@ private:
   std::deque<PaddedSlot> slots_;        // structure guarded by slot_free_mutex_; PaddedSlot addresses stable
   std::atomic_size_t active_count_ = 0; // atomically maintained; mirrors slot_free_ occupancy
 
-  // Retired records from threads that exited with still-protected survivors.
+  // Retired objects from threads that exited with still-protected survivors.
   // Collected by synchronize() alongside live-thread lists.
-  std::vector<RetireRecord> orphan_list_; // guarded by orphan_mutex_
+  RetireList orphan_list_; // guarded by orphan_mutex_
   std::mutex orphan_mutex_;
 
   RetireListNode* retire_lists_head_ = nullptr; // guarded by retire_lists_mutex_
@@ -273,26 +450,25 @@ inline HazardDomain& hazptr_default_domain() noexcept {
 // Per-thread node in the retire_lists_ linked list.
 // Each thread that calls retire_impl() or synchronize() has exactly one node,
 // registered lazily on first use and removed when the thread exits.
-// list_mutex guards *list against concurrent access between synchronize() (any thread)
-// and retire_impl() (the owning thread). retire_lists_mutex_ guards the list structure
-// (next pointers, retire_lists_head_) but NOT the contents of *list.
+// list_mutex guards list against concurrent access between synchronize() (any thread)
+// and retire_impl() (the owning thread). retire_lists_mutex_ guards the registry
+// structure (next pointers, retire_lists_head_) but NOT the contents of list.
+//
+// The list lives directly in the node now that it is intrusive. The previous
+// ThreadState wrapper existed only so that a separately-stored std::vector
+// outlived this node during thread exit; three raw pointers need no such
+// ordering.
 struct RetireListNode {
-  std::vector<RetireRecord>* list = nullptr; // points to this thread's retire list; null = not yet registered
-  std::mutex list_mutex;                     // guards *list: synchronize() vs retire_impl() on owning thread
-  RetireListNode* next = nullptr;            // intrusive singly-linked list; guarded by retire_lists_mutex_
+  RetireList list;                // guarded by list_mutex
+  std::mutex list_mutex;          // guards list: synchronize() vs retire_impl() on owning thread
+  RetireListNode* next = nullptr; // intrusive registry link; guarded by retire_lists_mutex_
+  bool registered = false;        // written only by the owning thread, only once
 
   // Called on thread exit. Drains the retire list, offloads survivors, then unregisters.
   ~RetireListNode();
 };
 
-// Bundles a thread's retire list and its registry node into one object so that
-// C++ member-destruction order (reverse of declaration) guarantees retire_list
-// outlives node -- i.e. ~RetireListNode() always runs before retire_list is freed.
-struct ThreadState {
-  std::vector<RetireRecord> retire_list; // destroyed second (last)
-  RetireListNode node;                   // destroyed first -> ~RetireListNode() sees a live retire_list
-};
-inline thread_local ThreadState tl_state_; // external linkage -- one instance per thread across all TUs
+inline thread_local RetireListNode tl_node_; // external linkage -- one instance per thread across all TUs
 } // namespace detail
 
 // --- Free functions ---------------------------------------------------------
@@ -308,8 +484,12 @@ inline void swap(hazard_pointer& a, hazard_pointer& b) noexcept { a.swap(b); }
 
 template <typename T, typename D>
 inline void hazard_pointer_obj_base<T, D>::retire(D d) noexcept {
-  // noexcept per std API. retire_impl() may throw (mutex::lock, vector::push_back).
-  // Any exception escaping this boundary calls std::terminate().
+  // noexcept per std API, and now actually honoured on the allocation side:
+  // retire_impl() splices this object onto an intrusive list, so there is no
+  // vector to grow and no way for OOM to reach std::terminate(). The only
+  // operation left that can throw is std::mutex::lock (system_error), which is
+  // not a memory-pressure failure; removing it needs the lock-free slot claim
+  // tracked as R3.
 
   // [32.11.3.3]/1: D shall be a function object type for which d(ptr) is valid (T* ptr).
   static_assert(std::is_invocable_v<D, T*>, "D must be invocable with T* -- [32.11.3.3]/1");
@@ -325,27 +505,31 @@ inline void hazard_pointer_obj_base<T, D>::retire(D d) noexcept {
   static_assert(!std::is_virtual_base_of_v<hazard_pointer_obj_base<T, D>, T>,
                 "hazard_pointer_obj_base<T, D> must be a non-virtual base of T -- [32.11.3.3]/5");
 #endif
-#ifdef __cpp_contracts
-  retired_ = true; // mark before retire_impl so any recursive synchronize() sees the correct state
+  // [32.11.3.3]/6 precondition: x is not retired. The next == this sentinel
+  // backs it in every build, not only under contracts -- unlike the bool it
+  // replaces, which made sizeof(hazard_pointer_obj_base) depend on whether the
+  // translation unit was compiled with contracts enabled.
+#ifndef __cpp_contracts
+  assert(not_retired() && "hazard_pointer_obj_base::retire: object is already retired");
 #endif
 
   deleter = std::move(d);
 
-  // D is the first data member of this base class. hazard_pointer_obj_base has one empty
-  // private base (hazard_obj_base_tag) which contributes zero bytes via EBO, so D still
-  // sits at offset 0 of the base subobject. The base subobject itself sits at offset 0 of T
-  // (single non-virtual inheritance). So the T* and the D* share an address -- the lambda
-  // can recover the deleter via a cast to hazard_pointer_obj_base*.
-  static_assert(offsetof(hazard_pointer_obj_base, deleter) == 0,
-                "D deleter must be at offset 0 for the retire() cast to be valid");
+  // Type erasure: the domain holds HazptrObj*, and only this instantiation knows
+  // T and D. The downcast to hazard_pointer_obj_base is a real derived-to-base
+  // cast in reverse, so it works at any offset -- no layout assumption. (The
+  // previous version asserted the deleter sat at offset 0, which was never
+  // needed and stops holding now that the private base carries members.)
+  reclaim = [](detail::HazptrObj* p) {
+    auto* base = static_cast<hazard_pointer_obj_base*>(p);
+    T* self = static_cast<T*>(base);
+    D deleter_copy = std::move(base->deleter);
+    deleter_copy(self);
+  };
 
-  T* self = static_cast<T*>(this);
-  detail::hazptr_default_domain().retire_impl(static_cast<void*>(self), [](void* p) {
-    T* self_ = static_cast<T*>(p);
-    auto* base = static_cast<hazard_pointer_obj_base*>(self_);
-    D d = std::move(base->deleter);
-    d(self_);
-  });
+  // Pass the HazptrObj subobject, not the T*: that is the address
+  // reset_protection() publishes and synchronize() compares against.
+  detail::hazptr_default_domain().retire_impl(this);
 }
 
 // --- hazard_pointer implementation ------------------------------------------
@@ -403,8 +587,16 @@ inline void hazard_pointer::reset_protection(const T* ptr) noexcept {
   static_assert(detail::HazardProtectable<T>, "T must be a hazard-protectable type -- [32.11.3.4.3]/7");
   if (ptr == nullptr)
     reset_protection();
-  else if (slot_)
-    slot_->store(const_cast<void*>(static_cast<const void*>(ptr)), std::memory_order::seq_cst);
+  else if (slot_) {
+    // Publish the HazptrObj subobject, not the T*. That is what synchronize()
+    // compares against, and the two differ whenever the base is not at offset 0
+    // -- e.g. struct T : Other, hazard_pointer_obj_base<T>, which
+    // [saferecl.hp.general] p2 permits. Folly normalises the same way, in
+    // hazptr_holder::reset_protection. The offset is a compile-time constant,
+    // so the reader path pays an add at most.
+    const detail::HazptrObj* const obj = ptr; // derived-to-base; private, reachable via friend
+    slot_->store(const_cast<detail::HazptrObj*>(obj), std::memory_order::seq_cst);
+  }
 }
 
 inline void hazard_pointer::reset_protection(std::nullptr_t) noexcept {
@@ -421,11 +613,15 @@ inline HazardDomain::HazardDomain() : slot_free_(kInitialSlots, true), slots_(kI
 
 inline HazardDomain::~HazardDomain() {
   // Called during static-storage destruction (program exit). Thread-local storage is destroyed
-  // before static storage, so tl_state_ is already gone -- synchronize() cannot be called.
+  // before static storage, so tl_node_ is already gone -- synchronize() cannot be called.
   // All threads have exited, so no hazard pointers are held; the protected-set check is
-  // unnecessary and every orphan record can be deleted unconditionally.
-  for (const RetireRecord& r : orphan_list_)
-    r.deleter(r.ptr);
+  // unnecessary and every orphan object can be reclaimed unconditionally.
+  for (HazptrObj* obj = orphan_list_.head; obj != nullptr;) {
+    HazptrObj* const next = obj->next; // read before reclaim(): it frees obj
+    obj->reclaim(obj);
+    obj = next;
+  }
+  orphan_list_.clear();
 }
 
 inline std::atomic<void*>* HazardDomain::acquire_slot() {
@@ -463,20 +659,21 @@ inline std::size_t HazardDomain::active_slots() const noexcept {
   return active_count_.load(std::memory_order::relaxed);
 }
 
-inline std::size_t HazardDomain::retire_list_size() const noexcept { return tl_state_.retire_list.size(); }
+inline std::size_t HazardDomain::retire_list_size() const noexcept { return tl_node_.list.size; }
 
-inline void HazardDomain::retire_impl(void* ptr, deleter_fn deleter) {
-  // Lazy registration: on the first retire_impl() call per thread, insert tl_state_.node into
-  // the global retire_lists_ linked list. node.list == nullptr serves as the "not yet
-  // registered" sentinel -- safe to check without a lock because only the owning thread
-  // ever writes this field (and only once, here).
+inline void HazardDomain::retire_impl(HazptrObj* obj) noexcept {
+  // Lazy registration: on the first retire_impl() call per thread, insert tl_node_ into
+  // the global retire_lists_ linked list. tl_node_.registered is safe to check without a
+  // lock because only the owning thread ever writes it (and only once, here).
   ensure_node_registered();
 
-  // Push under list_mutex so synchronize() cannot observe a partially-grown vector.
+  // Splice under list_mutex so synchronize() cannot observe a half-linked list.
+  // This is the operation that used to be a vector push_back, i.e. the reason
+  // retire() could turn OOM into terminate().
   const std::size_t sz = [&] {
-    const std::lock_guard _(tl_state_.node.list_mutex);
-    tl_state_.retire_list.push_back({ptr, deleter});
-    return tl_state_.retire_list.size();
+    const std::lock_guard _(tl_node_.list_mutex);
+    tl_node_.list.push(obj);
+    return tl_node_.list.size;
   }();
 
   // Threshold is a heuristic: trigger a scan when the retire list grows to more than
@@ -504,59 +701,84 @@ inline void HazardDomain::unregister_node(const RetireListNode& node) noexcept {
   --retire_list_node_count_;
 }
 
-inline void append_to(std::vector<RetireRecord>& dst, const std::vector<RetireRecord>& src) {
-#ifdef __cpp_lib_containers_ranges
-  dst.append_range(src);
-#else
-  dst.insert(dst.end(), src.begin(), src.end());
-#endif
+// Splice a collected-but-unscanned list onto the calling thread's own list,
+// leaving it empty. Used both for survivors and for the bail-out path when the
+// scan cannot be sized; in either case the objects stay retired and reachable,
+// so a later synchronize() reclaims them.
+//
+// "local" means the calling thread's, which is deliberately not the thread the
+// objects were retired on -- that one may have exited since the collect.
+inline void splice_to_local_list(RetireList& list) noexcept {
+  if (list.empty())
+    return;
+  const std::lock_guard _(tl_node_.list_mutex);
+  tl_node_.list.splice(list);
 }
 
-inline void HazardDomain::synchronize() {
+inline void HazardDomain::synchronize() noexcept {
   // Ensure this thread is registered so survivors have a valid home to return to.
   // Mirrors the registration in retire_impl(); safe to call from either path.
   ensure_node_registered();
 
-  // Step 1: collect -- atomically swap every thread's retire list with an empty one,
-  // then drain the orphan list. Done BEFORE snapshot so that any reader publishing
+  // Step 1: collect -- detach every thread's retire list, then the orphan list,
+  // and concatenate them. Done BEFORE snapshot so that any reader publishing
   // a hazard concurrently with the collect step sees the object still in src (and
   // thus retries) OR has the hazard visible in the snapshot below.
-  std::vector<RetireRecord> all_pending;
+  //
+  // Every step here is a pointer splice: the collect phase no longer allocates.
+  RetireList pending;
   {
-    std::vector<std::vector<RetireRecord>> tmp;
-    tmp.reserve(active_count_.load(std::memory_order::relaxed)); // hint
-    {
-      const std::lock_guard _(retire_lists_mutex_);
-      tmp.reserve(retire_list_node_count_);
-      for (RetireListNode* n = retire_lists_head_; n; n = n->next) {
-        tmp.emplace_back();
-        const std::lock_guard _(n->list_mutex);
-        std::swap(tmp.back(), *n->list);
-      }
-    }
-    const std::size_t sz = std::ranges::fold_left(
-        tmp, std::size_t{0}, [](std::size_t sz, const std::vector<RetireRecord>& x) { return sz + x.size(); });
-    all_pending.reserve(sz);
-    for (const std::vector<RetireRecord>& t : tmp) {
-      append_to(all_pending, t);
+    const std::lock_guard _(retire_lists_mutex_);
+    for (RetireListNode* n = retire_lists_head_; n; n = n->next) {
+      // The splice touches only the local `pending`, so it does not belong
+      // inside list_mutex. Narrowing matters here specifically: list_mutex is
+      // the lock retire_impl() takes on the owning thread's hot path, and this
+      // loop already holds retire_lists_mutex_ for its whole duration.
+      RetireList taken = [&] {
+        const std::lock_guard _l(n->list_mutex);
+        return n->list.take();
+      }();
+      pending.splice(taken);
     }
   }
   {
-    const std::lock_guard _(orphan_mutex_);
-    append_to(all_pending, orphan_list_);
-    orphan_list_.clear();
+    // Same shape, for symmetry rather than for measurable gain: orphan_mutex_
+    // is taken only on thread exit and by synchronize() itself, so it is
+    // essentially uncontended.
+    RetireList taken = [&] {
+      const std::lock_guard _(orphan_mutex_);
+      return orphan_list_.take();
+    }();
+    pending.splice(taken);
   }
+  if (pending.empty())
+    return;
 
   // Step 2: snapshot slot addresses under slot_free_mutex_ for a consistent view of slots_.
   // Actual acquire loads happen after releasing the lock.
-  const std::size_t active_hint = active_count_.load(std::memory_order::relaxed);
+  //
+  // This is the one part of reclamation that still allocates, and it is why the
+  // whole scan sits inside a try block: on OOM the collected objects go back on
+  // an intrusive list instead of propagating out of a noexcept function.
+  // Deferring reclamation is conforming -- [saferecl.hp.general] p7 leaves the
+  // number of possibly-reclaimable objects unbounded -- and it is lossless only
+  // because the objects are already linked. Making the scan itself
+  // allocation-free needs the slot pool to become a linked structure; that is
+  // tracked as R3.
   std::vector<const std::atomic<void*>*> slot_ptrs;
-  slot_ptrs.reserve(active_hint);
-  {
-    const std::lock_guard _(slot_free_mutex_);
-    slot_ptrs.reserve(slots_.size());
-    for (const PaddedSlot& s : slots_)
-      slot_ptrs.push_back(&s.value);
+  std::vector<void*> snapshot_slots;
+  try {
+    slot_ptrs.reserve(active_count_.load(std::memory_order::relaxed)); // hint
+    {
+      const std::lock_guard _(slot_free_mutex_);
+      slot_ptrs.reserve(slots_.size());
+      for (const PaddedSlot& s : slots_)
+        slot_ptrs.push_back(&s.value);
+    }
+    snapshot_slots.reserve(slot_ptrs.size());
+  } catch (...) {
+    splice_to_local_list(pending);
+    return;
   }
   // Reclaim-side fence -- MANDATORY, not an optimization barrier.
   //
@@ -583,60 +805,56 @@ inline void HazardDomain::synchronize() {
   // https://gcc.gnu.org/pipermail/libstdc++/2026-July/067282.html
   std::atomic_thread_fence(std::memory_order::seq_cst);
 
-  std::vector<void*> snapshot_slots;
-  snapshot_slots.reserve(slot_ptrs.size());
   for (const std::atomic<void*>* sp : slot_ptrs) {
     if (void* ptr = sp->load(std::memory_order::acquire)) // NOLINT(misc-const-correctness)
-      snapshot_slots.push_back(ptr);
+      snapshot_slots.push_back(ptr);                      // within the capacity reserved above
   }
   std::ranges::sort(snapshot_slots);
 
-  // Step 3: reclaim -- delete every record not in the protected set.
+  // Step 3: reclaim -- reclaim every object not in the protected set.
   // No lock held here; deleters can safely call retire() or even synchronize().
-  // snapshot_slots is sorted above; binary_search is O(log n) per record.
-  std::vector<RetireRecord> survivors;
-  survivors.reserve(all_pending.size());
-  for (const RetireRecord& r : all_pending) {
-    if (std::ranges::binary_search(snapshot_slots, r.ptr))
-      survivors.push_back(r);
-    else {
-      r.deleter(r.ptr);
-    }
+  // snapshot_slots is sorted above; binary_search is O(log n) per object.
+  //
+  // Both sides of the comparison are HazptrObj subobject addresses: retire()
+  // passes one, and reset_protection() publishes one.
+  RetireList survivors;
+  for (HazptrObj* obj = pending.head; obj != nullptr;) {
+    HazptrObj* const next = obj->next; // read before the object is spliced or freed
+    if (std::ranges::binary_search(snapshot_slots, static_cast<void*>(obj)))
+      survivors.push(obj);
+    else
+      obj->reclaim(obj);
+    obj = next;
   }
 
   // Step 4: put survivors back into the calling thread's own list.
   // Survivors cannot be returned to their original threads because those threads may
   // have exited between the collect and here. The calling thread's list is guaranteed
   // alive for the duration of this call.
-  if (!survivors.empty()) {
-    const std::lock_guard _(tl_state_.node.list_mutex);
-    append_to(tl_state_.retire_list, survivors);
-  }
+  splice_to_local_list(survivors);
 }
 
 inline void HazardDomain::ensure_node_registered() {
-  thread_local bool registered = false;
-  if (registered)
+  if (tl_node_.registered)
     return;
-  tl_state_.node.list = &tl_state_.retire_list;
   {
     const std::lock_guard _(retire_lists_mutex_);
-    tl_state_.node.next = retire_lists_head_;
-    retire_lists_head_ = &tl_state_.node;
+    tl_node_.next = retire_lists_head_;
+    retire_lists_head_ = &tl_node_;
     ++retire_list_node_count_;
   }
-  registered = true; // set only after successful registration
+  tl_node_.registered = true; // set only after successful registration
 }
 
 inline RetireListNode::~RetireListNode() {
-  if (!list)
+  if (!registered)
     return; // ensure_node_registered never ran -- nothing to do
 
   HazardDomain& domain = hazptr_default_domain();
 
   // Reclaim as much as possible before this thread's retire list goes away.
-  // synchronize() puts survivors back into tl_state_.retire_list (still alive here
-  // because ThreadState destroys node before retire_list).
+  // synchronize() puts survivors back into tl_node_.list, which is a member of
+  // *this and therefore still alive throughout this destructor body.
   domain.synchronize();
 
   // Unregister before touching the retire list without list_mutex.
@@ -649,10 +867,9 @@ inline RetireListNode::~RetireListNode() {
 
   // Move any remaining survivors (still actively protected) to the domain's orphan list
   // so a future synchronize() from any thread can eventually reclaim them.
-  if (!list->empty()) {
+  if (!list.empty()) {
     const std::lock_guard _(domain.orphan_mutex_);
-    append_to(domain.orphan_list_, *list);
-    list->clear();
+    domain.orphan_list_.splice(list);
   }
 }
 } // namespace detail

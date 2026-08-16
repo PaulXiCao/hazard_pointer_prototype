@@ -9,5 +9,5 @@ struct Plain {};
 void test() {
   auto hp = proto::make_hazard_pointer();
   std::atomic<Plain*> src{nullptr};
-  (void)hp.protect(src); // Plain has no hazard_obj_base_tag base -> concept unsatisfied
+  (void)hp.protect(src); // Plain has no HazptrObj base -> concept unsatisfied
 }

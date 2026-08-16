@@ -91,16 +91,17 @@ Public API in namespace `proto`; internals in `proto::detail`.
 
 ### Public API
 
-- **`hazard_pointer_obj_base<T, D>`** -- CRTP base. `retire()` enqueues `this` for deferred deletion.
+- **`hazard_pointer_obj_base<T, D>`** -- CRTP base. `retire()` splices `this` onto the calling thread's retire list for deferred deletion. `retire()` is `noexcept` per [saferecl.hp.base] and, because the list is intrusive, genuinely cannot allocate.
 - **`hazard_pointer`** -- RAII slot handle. `protect(src)` / `try_protect(ptr, src)` / `reset_protection()`.
 - **`make_hazard_pointer()`** -- acquires one slot from the default domain.
 
 ### Internals (`proto::detail`)
 
+- **`HazptrObj`** -- non-template private base of `hazard_pointer_obj_base<T,D>`. Holds the intrusive retire link, the type-erased reclaim function, and the space P2530R3 sec. 1.5 reserves for cohorts and integrated counting. Also serves as the tag `HazardProtectable` detects. `next == this` means "not retired", which backs the double-retire precondition at zero cost.
+- **`RetireList`** -- intrusive singly-linked list of `HazptrObj` with head/tail/size, so concatenation in `synchronize()` is O(1) and allocation-free.
 - **`HazardDomain`** -- singleton owning a growable hazard slot pool (starts at `kInitialSlots=8`, grows on demand) and the per-thread retire list registry.
-- **`RetireListNode`** -- per-thread node registered lazily into a global linked list. On thread exit `~RetireListNode()` drains the list, offloads still-protected survivors to `HazardDomain::orphan_list_`, then unregisters.
-- **`ThreadState`** -- bundles `retire_list` and `node` into one `thread_local` so that C++ member-destruction order guarantees the vector outlives the node.
-- **`tl_state_`** -- one `thread_local ThreadState` per thread across all TUs.
+- **`RetireListNode`** -- per-thread node holding that thread's `RetireList`, registered lazily into a global linked list. On thread exit `~RetireListNode()` drains the list, offloads still-protected survivors to `HazardDomain::orphan_list_`, then unregisters.
+- **`tl_node_`** -- one `thread_local RetireListNode` per thread across all TUs.
 
 ### Lock ordering
 
@@ -109,7 +110,7 @@ Public API in namespace `proto`; internals in `proto::detail`.
 | Mutex | Guards |
 |---|---|
 | `retire_lists_mutex_` | `retire_lists_head_`, node `next` pointers, `retire_list_node_count_` |
-| `list_mutex` (per-thread, in `RetireListNode`) | the contents of `*RetireListNode::list` |
+| `list_mutex` (per-thread, in `RetireListNode`) | the contents of `RetireListNode::list` |
 | `slot_free_mutex_` | `slot_free_[]`, `slots_[]` structure |
 | `orphan_mutex_` | `orphan_list_` |
 

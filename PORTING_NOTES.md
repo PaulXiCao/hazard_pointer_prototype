@@ -10,7 +10,11 @@ Transformations required when moving `hazard_ptr.hpp` into the libstdc++ tree. N
 - Split into fine-grained libstdc++ internal includes (`<bits/move.h>` etc.) instead of public C++ standard headers.
 - Annotate with `_GLIBCXX_NODISCARD`, `_GLIBCXX_NOEXCEPT`, `_GLIBCXX_BEGIN_NAMESPACE_VERSION`.
 - Strip prototype comments; replace with Doxygen / libstdc++ doc style.
-- Gate the `retired_` flag on the libstdc++ "contracts actually evaluated" macro rather than on `__cpp_contracts`. `__cpp_contracts` is set whenever contracts syntax is supported regardless of contract semantic (ignore / observe / enforce -- a separate compile-time switch with no standard preprocessor macro). Tie `retired_` to `_GLIBCXX_ASSERTIONS` or whatever internal macro GCC exposes for contracts-enforced builds.
+- Replace `PROTO_NO_UNIQUE_ADDRESS` with `_GLIBCXX_NO_UNIQUE_ADDRESS` and drop the MSVC branch. The attribute is not cosmetic: without it the empty `default_delete` member costs a full aligned word and `hazard_pointer_obj_base` grows past the size the layout tripwire pins.
+- Keep the `HazptrObj` base **private** and keep `hazard_pointer` a `friend` of `hazard_pointer_obj_base`. `reset_protection()` upcasts `T*` to that base, which is what makes the match key correct for `struct T : Other, hazard_pointer_obj_base<T>` ([saferecl.hp.general] p2 permits it). Folly makes its equivalent base public; private plus a friend keeps the implicit conversion out of user overload resolution.
+- Carry the layout `static_assert`s over. `hazard_pointer_obj_base` is a standard-specified type that users derive from, so its size is baked into user binaries, and `doc/xml/manual/abi.xml` lists changing the layout of a standard-specified type as a prohibited change. The reserved cohort pointer and counter exist so that size never has to move; the assertions are what stop a later refactor from moving it by accident.
+
+The `retired_` flag is gone -- the `next == this` sentinel replaced it, so there is no longer a member whose presence depends on `__cpp_contracts`. That mattered for more than tidiness: it made `sizeof(hazard_pointer_obj_base)` differ between translation units compiled with and without contracts.
 
 ## Known prototype-only workarounds
 
