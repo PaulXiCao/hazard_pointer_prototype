@@ -276,7 +276,25 @@ struct AbiPin {
   static constexpr bool ok = true;
 };
 
-static_assert(AbiPin<sizeof(hazard_pointer_obj_base<AbiProbe>), 32>::ok);
+// GCC and clang give the empty deleter zero size and measure 32. MSVC measures
+// 40: [[msvc::no_unique_address]] does not eliminate it here. The likely reason
+// is that HazptrObj is four 8-byte members with no tail padding to fold the
+// member into, so there is nothing for MSVC to overlay it with -- but that is a
+// hypothesis, and the measured 40 is the fact. Nothing rearranges to 32 on that
+// ABI without giving up a reserved member.
+//
+// Both numbers are pinned rather than MSVC being skipped, so the divergence
+// stays visible and an accidental layout change still fails the build
+// everywhere. Only the GCC/clang number is an ABI commitment: libstdc++ does
+// not ship on MSVC, and the port uses [[__no_unique_address__]] on a compiler
+// where it demonstrably works.
+#if defined(_MSC_VER) && !defined(__clang__)
+inline constexpr std::size_t kObjBaseSize = 40;
+#else
+inline constexpr std::size_t kObjBaseSize = 32;
+#endif
+
+static_assert(AbiPin<sizeof(hazard_pointer_obj_base<AbiProbe>), kObjBaseSize>::ok);
 static_assert(AbiPin<alignof(hazard_pointer_obj_base<AbiProbe>), 8>::ok);
 
 // The pinned number is per-ABI, so it is guarded on LP64 rather than
