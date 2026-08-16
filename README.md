@@ -83,7 +83,8 @@ silently.
 hazard_ptr.hpp              # single-header prototype
 PORTING_NOTES.md            # libstdc++ porting checklist
 CMakePresets.json           # dev / release / tsan / asan / ci / bench presets
-flake.nix                   # dev shell: clang-21, gcc-14, gcc-16, herd7
+flake.nix                   # `nix develop` -> clang-21, gcc-14, herd7, wrapped
+                            #   clangd/clang-tidy; `.#gcc16` -> gcc-16 shell
 cmake/CPM.cmake             # vendored, not fetched per configure
 tools/litmus/               # herd7 memory-model tests + run.sh (gating CI job)
 bench/                      # microbenchmarks, opt-in via ENABLE_BENCHMARKS
