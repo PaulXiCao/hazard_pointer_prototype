@@ -262,10 +262,22 @@ namespace detail {
 // rather than the field. Guarded on 8-byte pointers so 32-bit targets are not
 // held to a 64-bit number.
 struct AbiProbe : hazard_pointer_obj_base<AbiProbe> {};
-static_assert(sizeof(void*) != 8 || sizeof(hazard_pointer_obj_base<AbiProbe>) == 32,
-              "hazard_pointer_obj_base layout changed -- this is an ABI break, not a refactor");
-static_assert(sizeof(void*) != 8 || alignof(hazard_pointer_obj_base<AbiProbe>) == 8,
-              "hazard_pointer_obj_base alignment changed -- this is an ABI break");
+
+// Self-reporting, deliberately. A bare static_assert on sizeof() says only that
+// the number moved, never what it moved to, and on a compiler that cannot be
+// run locally that costs one CI round trip per guess -- which is exactly how
+// this was found on MSVC. Encoding both numbers as template arguments puts them
+// in the diagnostic: the failure reads AbiPin<40, 32>, actual first.
+template <std::size_t Actual, std::size_t Expected>
+struct AbiPin {
+  static_assert(sizeof(void*) != 8 || Actual == Expected,
+                "layout changed -- this is an ABI break, not a refactor. The template arguments "
+                "in this diagnostic are <actual, expected>.");
+  static constexpr bool ok = true;
+};
+
+static_assert(AbiPin<sizeof(hazard_pointer_obj_base<AbiProbe>), 32>::ok);
+static_assert(AbiPin<alignof(hazard_pointer_obj_base<AbiProbe>), 8>::ok);
 
 // The pinned number is per-ABI, so it is guarded on LP64 rather than
 // generalised: any formula portable enough to hold on every ABI would have to
@@ -384,8 +396,7 @@ namespace detail {
 // 3: the reserved domain pointer lives in HazptrRec precisely so that adding
 // custom domains later never has to widen this type. Section 3.1's ~4ns
 // construction/destruction is the other half of the reason.
-static_assert(sizeof(void*) != 8 || sizeof(hazard_pointer) == 8,
-              "hazard_pointer must stay one word -- see P2530R3 1.5 item 3");
+static_assert(AbiPin<sizeof(hazard_pointer), 8>::ok, "hazard_pointer must stay one word -- see P2530R3 1.5 item 3");
 } // namespace detail
 
 // --- Internal domain (not part of std API) ----------------------------------
