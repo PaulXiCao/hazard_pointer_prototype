@@ -8,8 +8,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <iterator>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -166,6 +164,55 @@ struct RetireList {
   // Detach the whole list, leaving *this empty.
   [[nodiscard]] RetireList take() noexcept { return std::exchange(*this, RetireList{}); }
 };
+
+// One hazard pointer record, padded to a full cache line so that records owned
+// by different threads do not share one -- prevents false sharing.
+// GCC warns that hardware_destructive_interference_size can vary with -mcpu/-mtune,
+// which would be an ABI hazard in a shared-library header. Safe to suppress here:
+// this is a single-TU prototype with no cross-TU ABI boundary on HazptrRec.
+// In libstdc++ proper, use __GCC_DESTRUCTIVE_SIZE (compiler built-in, no warning).
+//
+// This is the "internal structure associated with the actual hazard pointers"
+// of P2530R3 1.5 item 3. The paper is explicit that the domain pointer belongs
+// here rather than in hazard_pointer, and gives the reason: keeping the handle
+// one word wide is what buys the ~4ns construction/destruction of 3.1. Folly
+// agrees -- hazptr_holder is a single hazptr_rec*.
+//
+// Records are never destroyed before the domain is, and are never unlinked.
+// That is what lets synchronize() walk the list with plain atomic loads and no
+// lock, and what keeps the address a live hazard_pointer holds stable.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-warning-option" // must come first: suppresses the next line if unknown
+#pragma clang diagnostic ignored "-Winterference-size"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winterference-size"
+#endif
+struct alignas(std::hardware_destructive_interference_size) HazptrRec {
+  // The hazard pointer proper. Holds a HazptrObj* (see reset_protection) or null.
+  std::atomic<void*> hazard{nullptr};
+
+  // Claimed by a live hazard_pointer? Released with a plain store, claimed with
+  // a CAS, so neither path needs the allocation mutex.
+  std::atomic<bool> active{false};
+
+  // Written once, before the record is published; read by every scan.
+  HazptrRec* next = nullptr;
+
+  // RESERVED for P2530R3 1.5 item 3 (custom domains). Null means the default
+  // domain, which is the representation the paper suggests, so a future
+  // ~hazard_pointer can test it without changing the layout again. Reserve and
+  // initialise now, check later -- same argument as HazptrObj's reserved
+  // members, except that this one is not user-visible, so only libstdc++'s own
+  // inlined code is at stake.
+  void* domain = nullptr;
+};
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 } // namespace detail
 
 // --- hazard_pointer_obj_base ------------------------------------------------
@@ -231,7 +278,7 @@ static_assert(sizeof(void*) != 8 || alignof(hazard_pointer_obj_base<AbiProbe>) =
 
 // --- hazard_pointer ---------------------------------------------------------
 
-// RAII handle owning one slot in the default domain.
+// RAII handle owning one hazard pointer record in the default domain.
 // Acquired via make_hazard_pointer(). Not copyable; movable.
 class hazard_pointer {
 public:
@@ -241,7 +288,7 @@ public:
   // contract annotation and an in-class definition crashes gcc -fcontracts with an internal compiler error. Reported
   // upstream: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=125403 . Workaround: provide an empty user-defined body
   // instead of `= default`, but only for the affected toolchain (gcc with contracts enabled). All other configurations
-  // keep `= default`. Behavior is equivalent here because slot_ has a NSDMI (= nullptr), so value-init of the empty
+  // keep `= default`. Behavior is equivalent here because rec_ has a NSDMI (= nullptr), so value-init of the empty
   // body and defaulted init produce the same object state. Revisit once the gcc fix lands; restore `= default`
   // unconditionally then.
 #if defined(__cpp_contracts) && defined(__GNUC__) && !defined(__clang__)
@@ -273,7 +320,7 @@ public:
   hazard_pointer(const hazard_pointer&) = delete;
   hazard_pointer& operator=(const hazard_pointer&) = delete;
 
-  // True if this handle owns no hazard pointer (slot_ == nullptr).
+  // True if this handle owns no hazard pointer (rec_ == nullptr).
   // A handle that owns an unassociated hazard pointer (slot holds nullptr) is NOT empty.
   [[nodiscard]] bool empty() const noexcept;
 
@@ -305,24 +352,41 @@ public:
 #endif
           ;
 
-  // Clear the slot: store nullptr (release ordering).
+  // Clear the hazard: store nullptr (release ordering).
   // After this call, the previously protected object may be reclaimed by synchronize().
   void reset_protection(std::nullptr_t = nullptr) noexcept
 #ifdef __cpp_contracts
-      pre(!empty()) post(slot_->load(std::memory_order::relaxed) == nullptr)
+      pre(!empty()) post(rec_->hazard.load(std::memory_order::relaxed) == nullptr)
 #endif
           ;
 
-  // Exchange slots with other.
+  // Exchange records with other.
   void swap(hazard_pointer& other) noexcept;
 
 private:
-  std::atomic<void*>* slot_ = nullptr; // pointer into HazardDomain::slots_; null = empty handle
+  // One word, and deliberately so: P2530R3 1.5 item 3 puts the reserved domain
+  // pointer in the record rather than here, because a future custom-domain
+  // extension must not have to grow hazard_pointer -- that would be another
+  // prohibited layout change on a standard-specified type. An index would have
+  // been the cheaper way to delete release_rec()'s pool scan, but an index
+  // cannot name a domain, so it would have bought the scan back at the price of
+  // the extension.
+  detail::HazptrRec* rec_ = nullptr; // null = empty handle
 
-  explicit hazard_pointer(std::atomic<void*>* slot) noexcept;
+  explicit hazard_pointer(detail::HazptrRec* rec) noexcept;
 
   friend hazard_pointer make_hazard_pointer();
 };
+
+namespace detail {
+// hazard_pointer is frozen for the same reason as hazard_pointer_obj_base, and
+// pinned the same way. Staying one word is the whole point of P2530R3 1.5 item
+// 3: the reserved domain pointer lives in HazptrRec precisely so that adding
+// custom domains later never has to widen this type. Section 3.1's ~4ns
+// construction/destruction is the other half of the reason.
+static_assert(sizeof(void*) != 8 || sizeof(hazard_pointer) == 8,
+              "hazard_pointer must stay one word -- see P2530R3 1.5 item 3");
+} // namespace detail
 
 // --- Internal domain (not part of std API) ----------------------------------
 namespace detail {
@@ -350,71 +414,52 @@ concept HazardProtectable = std::is_class_v<T> && std::is_base_of_v<HazptrObj, T
 
 struct RetireListNode;
 
-// One hazard slot padded to a full cache line so adjacent slots in slots_[] do not
-// share a cache line -- prevents false sharing between threads using different slots.
-// GCC warns that hardware_destructive_interference_size can vary with -mcpu/-mtune,
-// which would be an ABI hazard in a shared-library header. Safe to suppress here:
-// this is a single-TU prototype with no cross-TU ABI boundary on PaddedSlot.
-// In libstdc++ proper, use __GCC_DESTRUCTIVE_SIZE (compiler built-in, no warning).
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunknown-warning-option" // must come first: suppresses the next line if unknown
-#pragma clang diagnostic ignored "-Winterference-size"
-#elif defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Winterference-size"
-#endif
-struct alignas(std::hardware_destructive_interference_size) PaddedSlot {
-  std::atomic<void*> value{nullptr};
-};
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#elif defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-
-// Owns the hazard slot pool and the pending retire list.
+// Owns the hazard pointer records and the pending retire list.
 // Process-global singleton; construction and destruction restricted to hazptr_default_domain().
 class HazardDomain {
 public:
-  // Claim a free slot. Grows the pool if all existing slots are occupied.
-  // Throws std::bad_alloc only on OOM.
-  [[nodiscard]] std::atomic<void*>* acquire_slot();
+  // Claim an unused record, appending a new one if every existing record is
+  // taken. Throws std::bad_alloc only on OOM -- this is the one function on the
+  // path from make_hazard_pointer(), which [saferecl.hp.make]/3 explicitly
+  // allows to throw. Every allocation this implementation performs on a live
+  // domain happens here.
+  [[nodiscard]] HazptrRec* acquire_rec();
 
-  // Return a slot to the pool.
-  void release_slot(std::atomic<void*>* slot);
+  // Return a record for reuse. Never allocates, never locks, never fails.
+  void release_rec(HazptrRec* rec) noexcept;
 
   // Splice obj onto the calling thread's retire list.
   // Auto-synchronizes when list size exceeds 2 * active_count_.
   // noexcept: reached from retire(), which [saferecl.hp.base] declares noexcept.
   void retire_impl(HazptrObj* obj) noexcept;
 
-  // Snapshot all active slots -> protected set.
+  // Snapshot all hazard records -> protected set.
   // Reclaim every retired object whose pointer is not in the protected set.
   // noexcept: same reason, plus [saferecl.hp.general]/5 makes a throwing
   // deleter undefined behaviour.
   void synchronize() noexcept;
 
-  // Number of currently acquired slots. Exposed for testing.
+  // Number of currently claimed records. Exposed for testing.
   [[nodiscard]] std::size_t active_slots() const noexcept;
 
   // Number of entries in the calling thread's retire list; exposed for single-thread testing.
   [[nodiscard]] std::size_t retire_list_size() const noexcept;
 
 private:
-  static constexpr std::size_t kInitialSlots = 8; // starting pool size; grows on demand
+  // Head of the append-only record list. Published with release, traversed with
+  // acquire; records are never unlinked, so a traversal needs no lock and no
+  // snapshot array. The deque and its parallel free bitmap are gone with it:
+  // the free flag now lives in the record, which costs nothing because records
+  // are cache-line padded anyway, and it is what makes release_rec() O(1)
+  // instead of a std::find_if over the whole pool.
+  std::atomic<HazptrRec*> recs_head_{nullptr};
 
-  // slot_free_[] and slots_[] are kept separate: slot_free_[] is a compact bool vector
-  // (1 cache line per 64 slots) so acquire_slot() scans it cheaply. Merging the free flag
-  // into PaddedSlot would force 1 cache-line miss per slot during acquisition.
-  //
-  // slots_[] uses deque so that PaddedSlot objects (and the &PaddedSlot::value pointers
-  // held by live hazard_pointer objects) are never invalidated when the deque grows:
-  // push_back/emplace_back on a deque does not move or relocate existing elements.
-  std::vector<bool> slot_free_; // guarded by slot_free_mutex_; true = available
-  std::mutex slot_free_mutex_;
-  std::deque<PaddedSlot> slots_;        // structure guarded by slot_free_mutex_; PaddedSlot addresses stable
-  std::atomic_size_t active_count_ = 0; // atomically maintained; mirrors slot_free_ occupancy
+  // Serialises appends only. The claim path is a CAS on HazptrRec::active and
+  // does not take it; the scan does not take it either.
+  std::mutex rec_alloc_mutex_;
+
+  std::atomic_size_t active_count_ = 0; // records currently claimed
+  std::atomic_size_t rec_count_ = 0;    // records ever created; sizes the scan buffer
 
   // Retired objects from threads that exited with still-protected survivors.
   // Collected by synchronize() alongside live-thread lists.
@@ -464,6 +509,16 @@ struct RetireListNode {
   RetireListNode* next = nullptr; // intrusive registry link; guarded by retire_lists_mutex_
   bool registered = false;        // written only by the owning thread, only once
 
+  // Scratch for synchronize()'s protected set, owned by and reused on this
+  // thread. Its capacity only has to grow when the record pool does, so after
+  // the first scan a steady-state reclamation allocates nothing at all.
+  //
+  // It cannot be sized from acquire_rec() the way every other allocation is: a
+  // thread that only ever retires never calls make_hazard_pointer(), so it
+  // would never reach that path. Growth therefore happens inside a noexcept
+  // function and has to be able to fail -- see synchronize().
+  std::vector<void*> scan_buf;
+
   // Called on thread exit. Drains the retire list, offloads survivors, then unregisters.
   ~RetireListNode();
 };
@@ -475,9 +530,11 @@ inline thread_local RetireListNode tl_node_; // external linkage -- one instance
 
 inline void swap(hazard_pointer& a, hazard_pointer& b) noexcept { a.swap(b); }
 
-// Acquire a slot from the default domain and return an owning handle.
+// Acquire a record from the default domain and return an owning handle.
+// The only function in the public interface allowed to allocate, and the only
+// one that does -- [saferecl.hp.make]/3, "Throws: May throw bad_alloc".
 [[nodiscard]] inline hazard_pointer make_hazard_pointer() {
-  return hazard_pointer(detail::hazptr_default_domain().acquire_slot());
+  return hazard_pointer(detail::hazptr_default_domain().acquire_rec());
 }
 
 // --- hazard_pointer_obj_base implementation ---------------------------------
@@ -534,31 +591,33 @@ inline void hazard_pointer_obj_base<T, D>::retire(D d) noexcept {
 
 // --- hazard_pointer implementation ------------------------------------------
 
-inline hazard_pointer::hazard_pointer(std::atomic<void*>* slot) noexcept : slot_(slot) {}
+inline hazard_pointer::hazard_pointer(detail::HazptrRec* rec) noexcept : rec_(rec) {}
 
+// Two relaxed-cost stores and no lock, which is what P2530R3 1.5 item 3 asks
+// of this destructor: it calls it out by name as inlined and latency-critical.
 inline hazard_pointer::~hazard_pointer() {
-  if (slot_) {
+  if (rec_) {
     reset_protection();
-    detail::hazptr_default_domain().release_slot(slot_);
+    detail::hazptr_default_domain().release_rec(rec_);
   }
 }
 
-inline hazard_pointer::hazard_pointer(hazard_pointer&& other) noexcept : slot_(other.slot_) { other.slot_ = nullptr; }
+inline hazard_pointer::hazard_pointer(hazard_pointer&& other) noexcept : rec_(other.rec_) { other.rec_ = nullptr; }
 
 inline hazard_pointer& hazard_pointer::operator=(hazard_pointer&& other) noexcept {
   if (this == &other)
     return *this;
   if (!empty()) {
     reset_protection();
-    detail::hazptr_default_domain().release_slot(slot_);
+    detail::hazptr_default_domain().release_rec(rec_);
   }
-  slot_ = other.slot_;
-  other.slot_ = nullptr;
+  rec_ = other.rec_;
+  other.rec_ = nullptr;
   return *this;
 }
 
 inline bool hazard_pointer::empty() const noexcept {
-  return slot_ == nullptr; // empty = owns no hazard pointer; unassociated (slot holds nullptr) is not empty
+  return rec_ == nullptr; // empty = owns no hazard pointer; unassociated (hazard holds nullptr) is not empty
 }
 
 template <typename T>
@@ -587,7 +646,7 @@ inline void hazard_pointer::reset_protection(const T* ptr) noexcept {
   static_assert(detail::HazardProtectable<T>, "T must be a hazard-protectable type -- [32.11.3.4.3]/7");
   if (ptr == nullptr)
     reset_protection();
-  else if (slot_) {
+  else if (rec_) {
     // Publish the HazptrObj subobject, not the T*. That is what synchronize()
     // compares against, and the two differ whenever the base is not at offset 0
     // -- e.g. struct T : Other, hazard_pointer_obj_base<T>, which
@@ -595,21 +654,24 @@ inline void hazard_pointer::reset_protection(const T* ptr) noexcept {
     // hazptr_holder::reset_protection. The offset is a compile-time constant,
     // so the reader path pays an add at most.
     const detail::HazptrObj* const obj = ptr; // derived-to-base; private, reachable via friend
-    slot_->store(const_cast<detail::HazptrObj*>(obj), std::memory_order::seq_cst);
+    rec_->hazard.store(const_cast<detail::HazptrObj*>(obj), std::memory_order::seq_cst);
   }
 }
 
 inline void hazard_pointer::reset_protection(std::nullptr_t) noexcept {
-  if (slot_) {
-    slot_->store(nullptr, std::memory_order::release);
+  if (rec_) {
+    rec_->hazard.store(nullptr, std::memory_order::release);
   }
 }
 
-inline void hazard_pointer::swap(hazard_pointer& other) noexcept { std::swap(slot_, other.slot_); }
+inline void hazard_pointer::swap(hazard_pointer& other) noexcept { std::swap(rec_, other.rec_); }
 
 // --- HazardDomain implementation --------------------------------------------
 namespace detail {
-inline HazardDomain::HazardDomain() : slot_free_(kInitialSlots, true), slots_(kInitialSlots) {}
+// No pre-allocated pool: records are created on demand and never destroyed
+// until the domain is, so a process that never uses hazard pointers pays
+// nothing and the constructor cannot fail.
+inline HazardDomain::HazardDomain() = default;
 
 inline HazardDomain::~HazardDomain() {
   // Called during static-storage destruction (program exit). Thread-local storage is destroyed
@@ -622,37 +684,55 @@ inline HazardDomain::~HazardDomain() {
     obj = next;
   }
   orphan_list_.clear();
+
+  // Records outlive every hazard_pointer by construction -- release_rec() only
+  // clears a flag -- so they are freed here, once all threads are gone.
+  for (HazptrRec* rec = recs_head_.load(std::memory_order::relaxed); rec != nullptr;) {
+    HazptrRec* const next = rec->next;
+    delete rec;
+    rec = next;
+  }
 }
 
-inline std::atomic<void*>* HazardDomain::acquire_slot() {
-  const std::lock_guard _(slot_free_mutex_);
-  const auto it = std::find(slot_free_.begin(), slot_free_.end(), true);
-  if (it != slot_free_.end()) {
-    *it = false;
-    ++active_count_;
-    return &slots_[std::distance(slot_free_.begin(), it)].value;
+inline HazptrRec* HazardDomain::acquire_rec() {
+  // Fast path: claim an existing record with a CAS. No lock, so concurrent
+  // make_hazard_pointer() calls only contend when they race for the same
+  // record. The old code serialised every acquisition on one mutex and scanned
+  // a bitmap under it -- review point 3.
+  for (HazptrRec* rec = recs_head_.load(std::memory_order::acquire); rec != nullptr; rec = rec->next) {
+    bool expected = false;
+    if (rec->active.compare_exchange_strong(expected, true, std::memory_order::acquire, std::memory_order::relaxed)) {
+      ++active_count_;
+      return rec;
+    }
   }
-  // All slots occupied -- grow the pool by one.
-  slot_free_.push_back(false);
-  slots_.emplace_back(); // throws std::bad_alloc on OOM
+
+  // Every record is taken -- append one. Serialised, but this is the rare path:
+  // it runs at most once per concurrently-live hazard_pointer, ever.
+  auto* const rec = new HazptrRec(); // throws std::bad_alloc on OOM
+  rec->active.store(true, std::memory_order::relaxed);
+  {
+    const std::lock_guard _(rec_alloc_mutex_);
+    rec->next = recs_head_.load(std::memory_order::relaxed);
+    // Release, paired with the acquire loads above and in synchronize(). A scan
+    // that does not observe this store cannot observe the hazard store that
+    // follows it either, and the seq_cst fence in synchronize() already forces
+    // the scan to observe any hazard whose reader went on to validate. So a
+    // record published after a scan started is one whose reader has not yet
+    // committed to protecting anything.
+    recs_head_.store(rec, std::memory_order::release);
+  }
   ++active_count_;
-  return &slots_.back().value;
+  ++rec_count_;
+  return rec;
 }
 
-inline void HazardDomain::release_slot(std::atomic<void*>* slot) {
-  slot->store(nullptr, std::memory_order::release); // clear hazard before returning slot to free pool
-  const std::lock_guard _(slot_free_mutex_);
-  const auto it = std::find_if(slots_.begin(), slots_.end(), [slot](const PaddedSlot& s) { return &s.value == slot; });
-  if (it != slots_.end()) {
-    slot_free_[std::distance(slots_.begin(), it)] = true;
-    --active_count_;
-    return;
-  }
-#ifdef __cpp_contracts
-  contract_assert(false);
-#else
-  assert(false && "HazardDomain: slot not found");
-#endif
+inline void HazardDomain::release_rec(HazptrRec* rec) noexcept {
+  rec->hazard.store(nullptr, std::memory_order::release); // clear the hazard before offering the record for reuse
+  --active_count_;
+  // Release so that a thread which later claims this record via the acquiring
+  // CAS sees the cleared hazard.
+  rec->active.store(false, std::memory_order::release);
 }
 
 inline std::size_t HazardDomain::active_slots() const noexcept {
@@ -754,31 +834,28 @@ inline void HazardDomain::synchronize() noexcept {
   if (pending.empty())
     return;
 
-  // Step 2: snapshot slot addresses under slot_free_mutex_ for a consistent view of slots_.
-  // Actual acquire loads happen after releasing the lock.
+  // Step 2: size the protected-set buffer. The record list needs no snapshot of
+  // its own any more -- records are never unlinked, so the scan below walks it
+  // directly, with no lock and no intermediate array.
   //
-  // This is the one part of reclamation that still allocates, and it is why the
-  // whole scan sits inside a try block: on OOM the collected objects go back on
-  // an intrusive list instead of propagating out of a noexcept function.
-  // Deferring reclamation is conforming -- [saferecl.hp.general] p7 leaves the
-  // number of possibly-reclaimable objects unbounded -- and it is lossless only
-  // because the objects are already linked. Making the scan itself
-  // allocation-free needs the slot pool to become a linked structure; that is
-  // tracked as R3.
-  std::vector<const std::atomic<void*>*> slot_ptrs;
-  std::vector<void*> snapshot_slots;
+  // The buffer belongs to this thread and is reused, so it only has to grow
+  // when the record pool does: after the first scan, a steady-state reclamation
+  // allocates nothing. Growth still has to be able to fail, because a thread
+  // that only retires never calls make_hazard_pointer() and so can first reach
+  // this point inside a noexcept function.
+  //
+  // On failure the scan falls back to a linear membership test instead of
+  // giving up: reclamation always completes, it is just slower. Each hazard is
+  // then re-loaded once per candidate rather than once in total, which is
+  // sound -- every load still happens after the fence below, and correctness
+  // needs each load to be ordered after it, not to be part of one instant.
+  std::vector<void*>& snapshot = tl_node_.scan_buf;
+  snapshot.clear();
+  bool have_buffer = true;
   try {
-    slot_ptrs.reserve(active_count_.load(std::memory_order::relaxed)); // hint
-    {
-      const std::lock_guard _(slot_free_mutex_);
-      slot_ptrs.reserve(slots_.size());
-      for (const PaddedSlot& s : slots_)
-        slot_ptrs.push_back(&s.value);
-    }
-    snapshot_slots.reserve(slot_ptrs.size());
+    snapshot.reserve(rec_count_.load(std::memory_order::relaxed));
   } catch (...) {
-    splice_to_local_list(pending);
-    return;
+    have_buffer = false;
   }
   // Reclaim-side fence -- MANDATORY, not an optimization barrier.
   //
@@ -805,22 +882,35 @@ inline void HazardDomain::synchronize() noexcept {
   // https://gcc.gnu.org/pipermail/libstdc++/2026-July/067282.html
   std::atomic_thread_fence(std::memory_order::seq_cst);
 
-  for (const std::atomic<void*>* sp : slot_ptrs) {
-    if (void* ptr = sp->load(std::memory_order::acquire)) // NOLINT(misc-const-correctness)
-      snapshot_slots.push_back(ptr);                      // within the capacity reserved above
+  HazptrRec* const recs = recs_head_.load(std::memory_order::acquire);
+
+  if (have_buffer) {
+    for (const HazptrRec* rec = recs; rec != nullptr; rec = rec->next) {
+      if (void* const ptr = rec->hazard.load(std::memory_order::acquire))
+        snapshot.push_back(ptr); // within the capacity reserved above
+    }
+    std::ranges::sort(snapshot);
   }
-  std::ranges::sort(snapshot_slots);
 
   // Step 3: reclaim -- reclaim every object not in the protected set.
   // No lock held here; deleters can safely call retire() or even synchronize().
-  // snapshot_slots is sorted above; binary_search is O(log n) per object.
   //
   // Both sides of the comparison are HazptrObj subobject addresses: retire()
   // passes one, and reset_protection() publishes one.
+  const auto protected_ = [&](const HazptrObj* obj) noexcept {
+    if (have_buffer)
+      return std::ranges::binary_search(snapshot, static_cast<const void*>(obj));
+    for (const HazptrRec* rec = recs; rec != nullptr; rec = rec->next) {
+      if (rec->hazard.load(std::memory_order::acquire) == static_cast<const void*>(obj))
+        return true;
+    }
+    return false;
+  };
+
   RetireList survivors;
   for (HazptrObj* obj = pending.head; obj != nullptr;) {
     HazptrObj* const next = obj->next; // read before the object is spliced or freed
-    if (std::ranges::binary_search(snapshot_slots, static_cast<void*>(obj)))
+    if (protected_(obj))
       survivors.push(obj);
     else
       obj->reclaim(obj);

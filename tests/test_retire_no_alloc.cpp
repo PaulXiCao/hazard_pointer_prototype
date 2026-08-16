@@ -100,6 +100,44 @@ TEST(RetireNoAlloc, RetireIsASpliceAndAllocatesNothing) {
   hazptr_default_domain().synchronize();
 }
 
+// The other half of the guarantee: retire() may auto-synchronize, so a
+// reclamation that allocates puts the allocation back on retire()'s path.
+// Records live in a linked list that the scan walks directly, and the
+// protected-set buffer is owned by the thread and reused, so once it has been
+// sized a reclamation allocates nothing at all.
+TEST(RetireNoAlloc, SteadyStateSynchronizeAllocatesNothing) {
+  using proto::detail::hazptr_default_domain;
+
+  constexpr int kSlots = 4;
+  std::vector<proto::hazard_pointer> hps;
+  hps.reserve(kSlots);
+  for (int i = 0; i < kSlots; ++i)
+    hps.push_back(proto::make_hazard_pointer());
+
+  // Warm-up: the first scan on this thread sizes the buffer, and the records
+  // themselves are created on demand. Both are allowed to allocate -- the
+  // claim is about the steady state, so reach it before measuring.
+  for (int i = 0; i < 4; ++i)
+    (new Node())->retire();
+  hazptr_default_domain().synchronize();
+  hazptr_default_domain().synchronize();
+
+  std::vector<Node*> nodes;
+  nodes.reserve(8);
+  for (int i = 0; i < 8; ++i)
+    nodes.push_back(new Node());
+
+  g_allocations.store(0, std::memory_order::relaxed);
+  g_armed.store(true, std::memory_order::relaxed);
+  for (Node* n : nodes)
+    n->retire();
+  hazptr_default_domain().synchronize();
+  g_armed.store(false, std::memory_order::relaxed);
+
+  EXPECT_EQ(g_allocations.load(std::memory_order::relaxed), 0) << "reclamation allocated in the steady state";
+  EXPECT_EQ(hazptr_default_domain().retire_list_size(), 0u) << "nothing was actually reclaimed";
+}
+
 TEST(RetireNoAlloc, ReclamationStillHappens) {
   using proto::detail::hazptr_default_domain;
 

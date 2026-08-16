@@ -66,7 +66,7 @@ tests/
   # One file per API function
   test_hazard_pointer_ctor.cpp   # default ctor, move ctor, destructor
   test_empty.cpp                 # hazard_pointer::empty()
-  test_make_hazard_pointer.cpp   # make_hazard_pointer(), slot pool grow/reuse
+  test_make_hazard_pointer.cpp   # make_hazard_pointer(), record pool grow/reuse
   test_protect.cpp               # protect()
   test_try_protect.cpp           # try_protect()
   test_reset_protection.cpp      # reset_protection() (both overloads)
@@ -92,26 +92,27 @@ Public API in namespace `proto`; internals in `proto::detail`.
 ### Public API
 
 - **`hazard_pointer_obj_base<T, D>`** -- CRTP base. `retire()` splices `this` onto the calling thread's retire list for deferred deletion. `retire()` is `noexcept` per [saferecl.hp.base] and, because the list is intrusive, genuinely cannot allocate.
-- **`hazard_pointer`** -- RAII slot handle. `protect(src)` / `try_protect(ptr, src)` / `reset_protection()`.
-- **`make_hazard_pointer()`** -- acquires one slot from the default domain.
+- **`hazard_pointer`** -- RAII handle over one `HazptrRec`, one word wide. `protect(src)` / `try_protect(ptr, src)` / `reset_protection()`.
+- **`make_hazard_pointer()`** -- acquires one record from the default domain. The only function here that allocates, which is what [saferecl.hp.make]/3 allows it to do.
 
 ### Internals (`proto::detail`)
 
 - **`HazptrObj`** -- non-template private base of `hazard_pointer_obj_base<T,D>`. Holds the intrusive retire link, the type-erased reclaim function, and the space P2530R3 sec. 1.5 reserves for cohorts and integrated counting. Also serves as the tag `HazardProtectable` detects. `next == this` means "not retired", which backs the double-retire precondition at zero cost.
 - **`RetireList`** -- intrusive singly-linked list of `HazptrObj` with head/tail/size, so concatenation in `synchronize()` is O(1) and allocation-free.
-- **`HazardDomain`** -- singleton owning a growable hazard slot pool (starts at `kInitialSlots=8`, grows on demand) and the per-thread retire list registry.
+- **`HazptrRec`** -- one hazard pointer record, cache-line padded: the hazard value, an `active` flag claimed by CAS, the list link, and the domain pointer P2530R3 sec. 1.5 item 3 reserves. Records are created on demand and never unlinked, so a live handle's address stays valid and the scan needs no lock.
+- **`HazardDomain`** -- singleton owning the append-only record list and the per-thread retire list registry.
 - **`RetireListNode`** -- per-thread node holding that thread's `RetireList`, registered lazily into a global linked list. On thread exit `~RetireListNode()` drains the list, offloads still-protected survivors to `HazardDomain::orphan_list_`, then unregisters.
 - **`tl_node_`** -- one `thread_local RetireListNode` per thread across all TUs.
 
 ### Lock ordering
 
-`HazardDomain` has four mutexes. Only one nesting case exists: in `synchronize()` step 1, `retire_lists_mutex_` (outer) is held while each per-thread `list_mutex` (inner) is briefly acquired to swap that thread's retire list. All other mutexes are acquired in isolation.
+`HazardDomain` has three mutexes. Only one nesting case exists: in `synchronize()` step 1, `retire_lists_mutex_` (outer) is held while each per-thread `list_mutex` (inner) is briefly acquired to detach that thread's retire list. All other mutexes are acquired in isolation. Neither claiming nor releasing a hazard pointer record takes a lock at all.
 
 | Mutex | Guards |
 |---|---|
 | `retire_lists_mutex_` | `retire_lists_head_`, node `next` pointers, `retire_list_node_count_` |
 | `list_mutex` (per-thread, in `RetireListNode`) | the contents of `RetireListNode::list` |
-| `slot_free_mutex_` | `slot_free_[]`, `slots_[]` structure |
+| `rec_alloc_mutex_` | appends to the record list only; claiming and releasing a record are lock-free |
 | `orphan_mutex_` | `orphan_list_` |
 
 ## Algorithm reference
@@ -119,9 +120,9 @@ Public API in namespace `proto`; internals in `proto::detail`.
 ### `try_protect()` -- single attempt
 
 ```
-store ptr -> slot (seq_cst)
+store ptr -> rec->hazard (seq_cst)
 reload src (seq_cst)
-if changed: clear slot, update ptr, return false
+if changed: clear hazard, update ptr, return false
 else: return true
 ```
 
@@ -138,15 +139,15 @@ loop: load src (relaxed) -> try_protect -> until success
 ### `synchronize()` -- scan + reclaim
 
 ```
-1. collect: foreach thread -- swap retire list out under list_mutex
-           + drain orphan_list_ (records from exited threads)
+1. collect: foreach thread -- detach retire list under list_mutex (O(1) splice)
+           + drain orphan_list_ (objects from exited threads)
 2. atomic_thread_fence(seq_cst)          <-- mandatory, see Memory Ordering
-3. snapshot all active slots -> protected set (acquire loads)
-4. reclaim: delete records not in protected set (no lock held -- deleters may call retire())
+3. walk the record list -> protected set (acquire loads, no lock)
+4. reclaim: reclaim objects not in protected set (no lock held -- deleters may call retire())
 5. survivors -> calling thread's own list
 ```
 
-Collect-then-snapshot, not snapshot-then-collect: every writer's retirement push happens under `list_mutex`, so the collect step's mutex acquires HB-after each writer's seq_cst exchange. When the snapshot's acquire-loads then run, the calling thread's vector clock already carries every writer's exchange clock. Reversing the order leaves the snapshot ahead of those mutex syncs, and TSan reports false-positive races in multi-writer/multi-reader workloads: the cross-atomic SC argument (seq_cst slot store <-> seq_cst src reload <-> seq_cst exchange) is beyond what TSan's vector-clock model tracks.
+Collect-then-snapshot, not snapshot-then-collect: every writer's retirement push happens under `list_mutex`, so the collect step's mutex acquires HB-after each writer's seq_cst exchange. When the snapshot's acquire-loads then run, the calling thread's vector clock already carries every writer's exchange clock. Reversing the order leaves the snapshot ahead of those mutex syncs, and TSan reports false-positive races in multi-writer/multi-reader workloads: the cross-atomic SC argument (seq_cst hazard store <-> seq_cst src reload <-> seq_cst exchange) is beyond what TSan's vector-clock model tracks.
 
 Survivors go to the calling thread because other threads may have exited between steps 1 and 4.
 
@@ -170,9 +171,9 @@ On thread exit, `~RetireListNode()`:
 
 | Operation | Ordering | Reason |
 |---|---|---|
-| `slot_->store(p)` in `reset_protection(T*)` | `seq_cst` | P2530R3; drains store buffer so snapshot cannot miss the hazard |
+| `rec_->hazard.store(p)` in `reset_protection(T*)` | `seq_cst` | P2530R3; drains store buffer so snapshot cannot miss the hazard |
 | `src.load()` re-check in `try_protect()` | `seq_cst` | P2530R3; SC pair with hazard store -- either snapshot sees hazard OR re-check sees new pointer |
-| `slot_->store(nullptr)` in `reset_protection()` | `release` | clearing hazard; no reclamation depends on observing the clear promptly |
+| `rec_->hazard.store(nullptr)` in `reset_protection()` | `release` | clearing hazard; no reclamation depends on observing the clear promptly |
 | `atomic_thread_fence` before the scan in `synchronize()` | `seq_cst` | **mandatory.** An acquire scan does not join the seq_cst total order, and the collect step's lock chain orders only a *writer's* retirement -- not an independent reader's hazard store. Without it: use-after-free on weak-memory targets. Upgrading the scan loads to seq_cst instead is **not** sufficient, because the removal store on `src` is user code and need not be seq_cst. See [tools/litmus](tools/litmus/) |
 | scan `s.load()` in `synchronize()` | `acquire` | sufficient *given the fence above* |
 | `active_count_` read in `retire_impl()` | `relaxed` | heuristic threshold; stale value acceptable |
