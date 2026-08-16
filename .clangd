@@ -1,5 +1,13 @@
 CompileFlags:
   CompilationDatabase: build
+  # hazard_ptr.hpp is header-only, so it owns no entry in the compilation
+  # database and clangd falls back to the nearest one by path -- which lands on
+  # tests/compile_fail/cf_nodiscard_empty.cpp, an OBJECT library that is
+  # deliberately built with a bare flag set.  The real test targets add
+  # -Wall -Wextra -Wpedantic (tests/CMakeLists.txt, add_hazptr_test), so
+  # without this the editor is quieter than the ci preset and warnings only
+  # surface in CI.  -Werror stays out: WARNINGS_AS_ERRORS is a CI switch.
+  Add: [-Wall, -Wextra, -Wpedantic]
 
 Diagnostics:
   UnusedIncludes: None

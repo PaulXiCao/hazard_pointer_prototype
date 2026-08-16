@@ -47,6 +47,43 @@
           name = "hazard-pointer-prototype";
 
           packages = with pkgs; [
+            # clangd must interrogate the driver named in compile_commands.json
+            # to learn where libstdc++ lives -- on NixOS the headers are under
+            # a store path no default search list contains, so a bare clangd
+            # reports "'algorithm' file not found" and ~20 follow-on errors for
+            # every file in this repo.  --query-driver is command-line only;
+            # clangd 21 rejects `CompileFlags.QueryDriver` in .clangd with
+            # "Unknown CompileFlags key", so the flag has to be baked in here.
+            #
+            # Must precede clang_21: that package ships a clangd of its own and
+            # the earlier entry wins the PATH lookup.
+            (writeShellScriptBin "clangd" ''
+              exec ${llvmPackages_21.clang-tools}/bin/clangd \
+                --query-driver="/nix/store/*/bin/clang++,/nix/store/*/bin/g++" \
+                "$@"
+            '')
+            # clang-tidy has the same blind spot and no --query-driver at all,
+            # so `clang-tidy -p build tests/test_retire.cpp` died on "'atomic'
+            # file not found" -- and the unresolved <atomic> then invented
+            # misc-const-correctness hits on every CAS local, because a call
+            # through an incomplete type looks like it cannot mutate its
+            # argument.  Hand it the search list the driver would have used.
+            # Hardcodes clang: clang-tidy parses with clang whichever compiler
+            # CMake was configured with, and must precede clang-tools below for
+            # the same PATH reason as clangd.
+            (writeShellScriptBin "clang-tidy" ''
+              set -euo pipefail
+              extra=()
+              while IFS= read -r dir; do
+                extra+=("--extra-arg=-isystem$dir")
+              done < <(
+                ${clang_21}/bin/clang++ -E -x c++ /dev/null -v 2>&1 |
+                  sed -n '/^#include <\.\.\.>/,/^End of search list\./p' |
+                  sed -n 's/^ //p'
+              )
+              exec ${llvmPackages_21.clang-tools}/bin/clang-tidy \
+                "''${extra[@]}" "$@"
+            '')
             clang_21                      # asan/tsan presets; matches CI's clang-21
             llvmPackages_21.clang-tools   # clang-tidy, clang-format
             llvm_21                       # llvm-symbolizer -- readable sanitizer traces
