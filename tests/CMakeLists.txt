@@ -82,6 +82,14 @@ endfunction()
 # hazard_pointer_obj_base
 add_hazptr_test(test_retire)
 add_hazptr_test(test_custom_deleter)
+# Replaces the global allocation functions, so it needs a binary of its own --
+# and it cannot be built under ASan/TSan, whose runtimes define the same
+# symbols (multiple definition of `operator delete(void*, unsigned long)').
+# The allocation audit is orthogonal to what the sanitizers check, so skipping
+# it there loses no coverage.
+if(NOT SANITIZE_ADDRESS AND NOT SANITIZE_THREAD)
+  add_hazptr_test(test_retire_no_alloc)
+endif()
 
 # hazard_pointer construction / destruction / move
 add_hazptr_test(test_hazard_pointer_ctor)
