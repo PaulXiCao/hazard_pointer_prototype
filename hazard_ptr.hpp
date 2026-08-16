@@ -103,22 +103,29 @@ struct HazptrObj {
 // list into one chain, and without a tail pointer each concatenation would walk
 // the list it is appending to.
 //
-// Replacing the per-thread std::vector with this is not the performance
-// regression it looks like:
-//   - retire() gets cheaper and, more importantly, predictable: two stores and
-//     an increment, with no reallocation and no amortisation spike.
-//   - synchronize()'s collect step goes from copying every record into one
-//     growing vector to O(1) pointer splices.
-//   - the scan is roughly neutral. It walks obj->next instead of a contiguous
-//     record array, but reclaiming an object already touches its first cache
-//     line (the destructor and operator delete both do), so those misses were
-//     going to be paid anyway; the vector was an extra array on top of them.
-// The real cost is memory, and it is worth being explicit about: the old
-// version spent 16 bytes per *retired* object, this one spends 32 bytes per
-// *protectable* object whether or not it is ever retired. That is the trade
-// P2530R3 1.5 and Folly both take, and it is not optional here -- an allocating
-// retire() cannot honour the noexcept in [saferecl.hp.base].
-// Numbers rather than reasoning: PLAN step 4's microbenchmark.
+// Replacing the per-thread std::vector with this bought the noexcept guarantee,
+// and -- measured, against the pre-R2 header -- essentially nothing else. The
+// numbers, from bench/ on a 6-core x86_64:
+//   - retire(), push only:            11.1ns against 11.2ns. Indistinguishable.
+//     The per-thread list_mutex costs more than the difference between a vector
+//     push_back and a pointer splice, so the splice is invisible under it.
+//   - retire(), amortised:            50.3ns against 66.7ns. That 1.33x is the
+//     scan getting cheaper, not the push.
+//   - synchronize(), 256 records:     447ns against 912ns.
+//   - synchronize(), 1024 records:    1803ns against 1551ns -- *slower*. A
+//     linked list of cache-line-padded records cannot prefetch like the
+//     contiguous pool it replaced, and records are never unlinked, so a process
+//     that once peaked at 1024 concurrent handles pays this for life.
+// So: do not describe this as a performance improvement. It is a correctness
+// change with a mixed performance profile. What it does buy is unconditional:
+// [saferecl.hp.base] declares retire() noexcept, and an allocating retire turns
+// OOM into terminate().
+//
+// The cost is memory, and it is worth being explicit about: the old version
+// spent 16 bytes per *retired* object, this one spends 32 bytes per
+// *protectable* object whether or not it is ever retired (measured:
+// sizeof(Node) 16 -> 48). That is the trade P2530R3 1.5 and Folly both take,
+// and it is not optional here.
 struct RetireList {
   HazptrObj* head = nullptr;
   HazptrObj* tail = nullptr;
