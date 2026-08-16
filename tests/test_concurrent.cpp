@@ -6,7 +6,6 @@
 #include <functional>
 #include <gtest/gtest.h>
 #include <hazard_ptr.hpp>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -40,17 +39,33 @@ namespace {
 constexpr int kPoisoned = -1;
 
 // Quarantined nodes are never freed during a run, so the writers below are
-// bounded by a node budget as well as by the stop flag.  At 8 bytes per node
-// plus a pointer here, this is roughly 1.6 MB across the four-writer test.
+// bounded by a node budget as well as by the stop flag.  At 56 bytes per node
+// this is roughly 11 MB across the four-writer test.
 constexpr int kMaxNodesPerWriter = 50000;
 
 struct QuarantinedNode;
 
+// An intrusive lock-free stack, not a mutex and a vector.  Three reasons, and
+// only the last one is portability:
+//
+//   - The deleter runs from synchronize(), which is noexcept.  A vector
+//     push_back can throw bad_alloc, so the previous version turned an OOM
+//     inside the test's own quarantine into std::terminate() -- the exact
+//     failure mode review point 2 exists to remove.  Pushing onto a link the
+//     node already carries cannot fail.
+//   - No mutex, so there is no lock-ordering argument to make against the
+//     domain's own locks.  (The old one was sound -- both deleter call sites
+//     run with no domain lock held -- but an argument that need not be made
+//     cannot be got wrong later.)
+//   - constinit below requires constant initialization, and on MSVC neither
+//     member qualified: its std::mutex constructor is not constexpr (it calls
+//     _Mtx_init_in_situ), and its Debug std::vector allocates a container
+//     proxy under _ITERATOR_DEBUG_LEVEL=2.  std::atomic<T*>'s value
+//     constructor is constexpr on every implementation.
 struct Quarantine {
-  std::vector<QuarantinedNode*> nodes;
-  std::mutex nodes_mtx;
+  std::atomic<QuarantinedNode*> head{nullptr};
 
-  void reclaim(QuarantinedNode* ptr);
+  void reclaim(QuarantinedNode* ptr) noexcept;
   ~Quarantine();
 };
 
@@ -60,38 +75,49 @@ struct Quarantine {
 // its construction before any dynamic initialization, and therefore its
 // destruction after the function-local static domain in
 // hazptr_default_domain().  Spelling it constinit makes the compiler enforce
-// that: a future member without a constexpr default ctor then breaks the build
-// here rather than the test at exit.
+// that: a member without a constexpr default ctor breaks the build here rather
+// than the test at exit.  Not hypothetical -- that is precisely how the
+// mutex-and-vector version of Quarantine failed, on MSVC only, with C2127.
 constinit Quarantine quarantine;
 
 // A separate stateless type is required: retire() needs D to be default
-// constructible and move assignable, which Quarantine's mutex rules out.
+// constructible and move assignable, and Quarantine is neither invocable nor
+// movable.
 struct QuarantineDeleter {
   void operator()(QuarantinedNode* ptr) const { quarantine.reclaim(ptr); }
 };
 
 struct QuarantinedNode : hazard_pointer_obj_base<QuarantinedNode, QuarantineDeleter> {
   int value;
+  // Quarantine link.  Only ever touched after the domain has handed the node
+  // to the deleter, i.e. once the domain is done with it, so it cannot alias
+  // the intrusive retire link inside the protected base.
+  QuarantinedNode* qnext = nullptr;
   explicit QuarantinedNode(int v) : value(v) {}
 };
 
-// Taking nodes_mtx cannot deadlock against the domain: both deleter call sites
-// run with no domain lock held -- see synchronize() step 3 ("No lock held here")
-// and ~HazardDomain().
-//
 // `value` is a plain int on purpose.  If the reclaim-side ordering is ever
 // wrong, this store races the reader's load of the same int and TSan reports
 // it, so one bug has two independent detectors.  A correct implementation has
 // no race here and TSan stays clean.
-void Quarantine::reclaim(QuarantinedNode* ptr) {
+//
+// The poison is written before the node is published to the stack, and the
+// release/acquire pair on head carries it to the destructor.  Nothing here can
+// throw, which is the point -- see the note on Quarantine above.
+void Quarantine::reclaim(QuarantinedNode* ptr) noexcept {
   ptr->value = kPoisoned;
-  const std::lock_guard _{nodes_mtx};
-  nodes.push_back(ptr);
+  QuarantinedNode* next = head.load(std::memory_order_relaxed);
+  do {
+    ptr->qnext = next;
+  } while (!head.compare_exchange_weak(next, ptr, std::memory_order_release, std::memory_order_relaxed));
 }
 
 Quarantine::~Quarantine() {
-  for (const QuarantinedNode* ptr : nodes)
+  for (const QuarantinedNode* ptr = head.load(std::memory_order_acquire); ptr != nullptr;) {
+    const QuarantinedNode* const next = ptr->qnext; // read before delete frees it
     delete ptr;
+    ptr = next;
+  }
 }
 
 // reads counts successful protects, so a test cannot pass by never observing a
