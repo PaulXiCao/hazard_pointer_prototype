@@ -700,9 +700,25 @@ inline HazptrRec* HazardDomain::acquire_rec() {
   // record. The old code serialised every acquisition on one mutex and scanned
   // a bitmap under it -- review point 3.
   for (HazptrRec* rec = recs_head_.load(std::memory_order::acquire); rec != nullptr; rec = rec->next) {
+    // Test-and-test-and-set. The relaxed load is not an optimisation for the
+    // contended case, it is what stops the walk from being O(pool) *locked*
+    // RMWs: without it every occupied record on the way to a free one costs a
+    // failed compare_exchange, and a failed CAS still acquires the line
+    // exclusively and dirties it. Measured on a 6-core x86_64, acquiring the
+    // 256th handle while 255 are held: 684ns with the bare CAS walk, against
+    // 111ns for the mutex-and-bitmap design this replaced. The relaxed load
+    // makes the walk cheap shared reads and leaves one CAS on the candidate.
+    // A stale `true` only costs a skipped record, and a stale `false` is
+    // resolved by the CAS below.
+    if (rec->active.load(std::memory_order::relaxed))
+      continue;
     bool expected = false;
     if (rec->active.compare_exchange_strong(expected, true, std::memory_order::acquire, std::memory_order::relaxed)) {
-      ++active_count_;
+      // Relaxed: this counter feeds retire_impl()'s heuristic threshold and
+      // active_slots(), which exists for tests. Nothing orders anything
+      // through it, and as a seq_cst RMW it was a second contended line on
+      // every acquire and release.
+      active_count_.fetch_add(1, std::memory_order::relaxed);
       return rec;
     }
   }
@@ -722,14 +738,14 @@ inline HazptrRec* HazardDomain::acquire_rec() {
     // committed to protecting anything.
     recs_head_.store(rec, std::memory_order::release);
   }
-  ++active_count_;
-  ++rec_count_;
+  active_count_.fetch_add(1, std::memory_order::relaxed);
+  rec_count_.fetch_add(1, std::memory_order::relaxed);
   return rec;
 }
 
 inline void HazardDomain::release_rec(HazptrRec* rec) noexcept {
   rec->hazard.store(nullptr, std::memory_order::release); // clear the hazard before offering the record for reuse
-  --active_count_;
+  active_count_.fetch_sub(1, std::memory_order::relaxed); // relaxed -- see acquire_rec()
   // Release so that a thread which later claims this record via the acquiring
   // CAS sees the cleared hazard.
   rec->active.store(false, std::memory_order::release);
